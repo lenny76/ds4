@@ -216,24 +216,34 @@ static bool ds41c_attention(ds41_cpu_graph *g, const ds4_model *m, const ds4_lay
     return true;
 }
 
-static void ds41c_moe(ds41_cpu_graph *g, const ds4_model *m, const ds4_layer_weights *l, unsigned il, int token) {
+static void ds41c_moe(ds41_cpu_graph *g, const ds4_model *m, const ds4_layer_weights *l,
+                      unsigned il, int token, double *shared_sec, double *routed_sec) {
+    const bool profile = shared_sec && routed_sec;
+    double started = profile ? now_sec() : 0.0;
     ds41c_mat(g->gate, m, l->ffn_gate_shexp, g->norm, true);
     ds41c_mat(g->up, m, l->ffn_up_shexp, g->norm, true);
     swiglu(g->mid, g->gate, g->up, DS4_N_FF_EXP, DS4_SWIGLU_CLAMP_EXP);
     ds41c_round(g->mid, DS4_N_FF_EXP);
     ds41c_mat(g->shared, m, l->ffn_down_shexp, g->mid, true);
+    if (profile) { *shared_sec += now_sec() - started; started = now_sec(); }
     /* Upstream's routed kernel keeps an F32 reduction. Only the shared
      * expert and the final combined block have explicit BF16 boundaries. */
     layer_routed_moe_one(g->block, m, l, g->norm, il, token, DS4_SWIGLU_CLAMP_EXP, false);
     for (unsigned i = 0; i < DS4_N_EMBD; i++) g->block[i] = ds41_cpu_bf16(g->block[i] + g->shared[i]);
+    if (profile) *routed_sec += now_sec() - started;
 }
 
 static bool ds41c_step(ds41_cpu_graph *g, const ds4_model *m, const ds4_weights *w, int token, float *logits) {
     if (!g->valid || g->pos >= g->ctx || token < 0 || (uint32_t)token >= DS4_N_VOCAB) return false;
+    const bool profile = getenv("DS4_CPU_V41_PROFILE") != NULL;
+    double engram_sec = 0, attn_hc_sec = 0, attn_sec = 0, attn_post_sec = 0;
+    double ffn_hc_sec = 0, shared_sec = 0, routed_sec = 0, ffn_post_sec = 0, head_sec = 0;
+    double started = profile ? now_sec() : 0.0;
     ds4_engram_history history = g->history; uint32_t ids[2][24];
     if (!ds4_engram_hash(&g->engram, &history, &token, NULL, 1, &ids[0][0])) return false;
     for (unsigned i = 0; i < 2; i++)
         if (!ds4_engram_read(&g->tables[i], ids[i], 24, g->disk_rows[i])) return false;
+    if (profile) engram_sec += now_sec() - started;
     g->valid = false;
     embed_token_any(m, w, token, g->x);
     hc_from_plain_embedding(g->residual, g->x, DS4_N_EMBD, 4);
@@ -241,28 +251,49 @@ static bool ds41c_step(ds41_cpu_graph *g, const ds4_model *m, const ds4_weights 
     for (unsigned il = 0; il < 40; il++) {
         const ds4_layer_weights *l = &w->layer[il];
         if (ds41_engram_layer(il)) {
+            started = profile ? now_sec() : 0.0;
             ds41c_mat(g->engram_kv, m, l->engram_kv, g->disk_rows[il == 1 ? 0 : 1], true);
             ds41_cpu_engram_add(g->residual, g->engram_kv, tensor_data(m, l->engram_q_norm),
                                 tensor_data(m, l->engram_k_norm), DS4_N_EMBD, DS4_RMS_EPS);
+            if (profile) engram_sec += now_sec() - started;
         }
+        started = profile ? now_sec() : 0.0;
         ds41c_hc(g, m, l, false);
         hc_weighted_sum_one(g->x, g->residual, g->pre, DS4_N_EMBD, 4);
         ds41c_round(g->x, DS4_N_EMBD); ds41c_norm(g->norm, g->x, m, l->attn_norm);
+        if (profile) attn_hc_sec += now_sec() - started;
+        started = profile ? now_sec() : 0.0;
         if (!ds41c_attention(g, m, l, il)) return false;
+        if (profile) attn_sec += now_sec() - started;
+        started = profile ? now_sec() : 0.0;
         hc_post_one(g->after, g->block, g->residual, g->attn_split + 4, g->attn_split + 8, DS4_N_EMBD, 4);
         ds41c_round(g->after, 4 * DS4_N_EMBD);
+        if (profile) attn_post_sec += now_sec() - started;
+        started = profile ? now_sec() : 0.0;
         ds41c_hc(g, m, l, true);
         hc_weighted_sum_one(g->x, g->after, g->attn_split, DS4_N_EMBD, 4);
         ds41c_round(g->x, DS4_N_EMBD); ds41c_norm(g->norm, g->x, m, l->ffn_norm);
-        ds41c_moe(g, m, l, il, token);
+        if (profile) ffn_hc_sec += now_sec() - started;
+        ds41c_moe(g, m, l, il, token,
+                  profile ? &shared_sec : NULL, profile ? &routed_sec : NULL);
+        started = profile ? now_sec() : 0.0;
         hc_post_one(g->residual, g->block, g->after, g->ffn_split + 4, g->ffn_split + 8, DS4_N_EMBD, 4);
         ds41c_round(g->residual, 4 * DS4_N_EMBD); memcpy(g->pre, g->ffn_split, sizeof(g->pre));
+        if (profile) ffn_post_sec += now_sec() - started;
     }
     if (logits) {
+        started = profile ? now_sec() : 0.0;
         hc_weighted_sum_one(g->x, g->residual, g->pre, DS4_N_EMBD, 4);
         ds41c_round(g->x, DS4_N_EMBD); ds41c_norm(g->norm, g->x, m, w->output_norm);
         ds41c_mat(logits, m, w->output, g->norm, false);
         for (unsigned i = 0; i < DS4_N_VOCAB; i++) if (!isfinite(logits[i])) return false;
+        if (profile) head_sec += now_sec() - started;
     }
+    if (profile) fprintf(stderr,
+        "ds4: V4.1 CPU profile pos=%u ms engram=%.3f attn_hc=%.3f attn=%.3f attn_post=%.3f "
+        "ffn_hc=%.3f shared=%.3f routed=%.3f ffn_post=%.3f head=%.3f\n",
+        g->pos, engram_sec * 1e3, attn_hc_sec * 1e3, attn_sec * 1e3,
+        attn_post_sec * 1e3, ffn_hc_sec * 1e3, shared_sec * 1e3,
+        routed_sec * 1e3, ffn_post_sec * 1e3, head_sec * 1e3);
     g->history = history; g->pos++; g->valid = true; return true;
 }

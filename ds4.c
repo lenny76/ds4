@@ -40,6 +40,10 @@
 #include <time.h>
 #include <unistd.h>
 
+#if defined(__x86_64__) || defined(__i386__)
+#include <immintrin.h>
+#endif
+
 #include "ds4.h"
 #include "ds4_tool_text.h"
 #include "ds4_distributed.h"
@@ -1106,7 +1110,21 @@ static void iq2xxs_signed_grid_init(void) {
 }
 
 static inline DS4_MAYBE_UNUSED int32_t dot_iq2_pair_16(const int8_t *grid0, const int8_t *grid1, const int8_t *q8) {
-#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
+#if defined(__AVX512VNNI__) && defined(__AVX512VL__)
+    /* VNNI's byte dot product is unsigned x signed. Bias the signed IQ2
+     * values by 128, then remove 128 * sum(q8) from the result. */
+    const __m128i g0 = _mm_loadl_epi64((const __m128i *)grid0);
+    const __m128i g1 = _mm_loadl_epi64((const __m128i *)grid1);
+    const __m128i gv = _mm_xor_si128(_mm_unpacklo_epi64(g0, g1),
+                                     _mm_set1_epi8((char)0x80));
+    const __m128i qv = _mm_loadu_si128((const __m128i *)q8);
+    const __m128i prod = _mm_dpbusd_epi32(_mm_setzero_si128(), gv, qv);
+    const __m128i pairs = _mm_maddubs_epi16(_mm_set1_epi8(1), qv);
+    const __m128i qsum4 = _mm_madd_epi16(pairs, _mm_set1_epi16(1));
+    const __m128i corrected = _mm_sub_epi32(prod, _mm_slli_epi32(qsum4, 7));
+    const __m128i sums2 = _mm_add_epi32(corrected, _mm_shuffle_epi32(corrected, 0x4e));
+    return _mm_cvtsi128_si32(_mm_add_epi32(sums2, _mm_shuffle_epi32(sums2, 0xb1)));
+#elif defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
     const int8x16_t gv = vcombine_s8(vld1_s8(grid0), vld1_s8(grid1));
     const int32x4_t acc = vdotq_s32(vdupq_n_s32(0), gv, vld1q_s8(q8));
     return vaddvq_s32(acc);
@@ -1125,7 +1143,21 @@ static inline DS4_MAYBE_UNUSED int32_t dot_iq2_pair_16(const int8_t *grid0, cons
 }
 
 static inline DS4_MAYBE_UNUSED int32_t dot_q2_16(const uint8_t *q2, const int8_t *q8, int shift) {
-#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
+#if defined(__AVX512VNNI__) && defined(__AVX512VL__)
+    const __m128i packed = _mm_loadu_si128((const __m128i *)q2);
+    __m128i shifted;
+    switch (shift) {
+    case 0: shifted = packed; break;
+    case 2: shifted = _mm_srli_epi16(packed, 2); break;
+    case 4: shifted = _mm_srli_epi16(packed, 4); break;
+    default: shifted = _mm_srli_epi16(packed, 6); break;
+    }
+    const __m128i vals = _mm_and_si128(shifted, _mm_set1_epi8(3));
+    const __m128i qv = _mm_loadu_si128((const __m128i *)q8);
+    const __m128i prod = _mm_dpbusd_epi32(_mm_setzero_si128(), vals, qv);
+    const __m128i sums2 = _mm_add_epi32(prod, _mm_shuffle_epi32(prod, 0x4e));
+    return _mm_cvtsi128_si32(_mm_add_epi32(sums2, _mm_shuffle_epi32(sums2, 0xb1)));
+#elif defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
     const uint8x16_t packed = vld1q_u8(q2);
     uint8x16_t shifted;
     switch (shift) {

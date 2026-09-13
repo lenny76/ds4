@@ -5,6 +5,10 @@ checkpoint prefill and decode have been validated on the development server;
 cross-backend logits parity is still pending. The graph remains behind
 `DS4_CPU_V41_EXPERIMENTAL=1`, so `make cpu` alone does not opt into V4.1.
 
+On x86-64, `make cpu` uses `-march=native`. CPUs exposing AVX-512 VNNI and
+AVX-512 VL therefore use exact integer VNNI kernels for the IQ2_XXS and Q2_K
+expert projections; other x86 CPUs retain the scalar implementation.
+
 ## Implemented
 
 `ds4_v41_cpu.c` contains CPU primitives for the V4.1 numerical boundaries:
@@ -53,8 +57,8 @@ prompt. This does not yet establish exact logits parity with Metal.
    reject the experimental CPU graph explicitly.
 3. Optimize prompt prefill after decode correctness is established; the current
    implementation deliberately uses the same scalar-token transition.
-4. Add CPU stage profiling, then optimize the dominant quantized projections
-   with the available SIMD instruction set.
+4. Optimize attention projections, now the largest stable warm-cache CPU cost
+   after the routed-expert VNNI kernels.
 
 ## Known limitations
 
@@ -64,3 +68,15 @@ prompt. This does not yet establish exact logits parity with Metal.
 - Vision, tensor parallelism and SSD streaming are not admitted by this path.
 - The implementation must be enabled explicitly with
   `DS4_CPU_V41_EXPERIMENTAL=1`.
+
+## Profiling
+
+Set `DS4_CPU_V41_PROFILE=1` to print per-token timings for Engram, attention,
+shared and routed experts, and the output head. The profiler is intended for
+development and remains off by default.
+
+On a dual-socket Cascade Lake system with 48 physical cores, warm-cache A/B
+measurements reduced the routed-expert stage from about 334 ms to 232 ms and
+the complete token from about 832 ms to 733 ms. Cold expert reads from SATA can
+still dominate an individual token, so compare kernels only after warming the
+same expert pages.

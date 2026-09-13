@@ -22,6 +22,23 @@ make test-deepseek41-cpu
 make test-engram test-deepseek41-gguf
 ```
 
+Build the CPU CLI and run a Q2 checkpoint:
+
+```sh
+make -j2 cpu
+DS4_CPU_V41_EXPERIMENTAL=1 ./ds4 --cpu -t 48 \
+  -m /path/to/DeepSeek-V4.1-Flash-Q2.gguf \
+  --ctx 4096 --nothink --temp 0 --tokens 32 \
+  --prompt "Write a short greeting."
+```
+
+The worker pool accepts up to 64 threads. More threads do not necessarily
+improve throughput: benchmark the same deterministic prompt at several thread
+counts. On the current reference host, increasing the effective pool from 32
+to 48 threads improved both prefill and decode by roughly 13-14%. Forcing
+`numactl --interleave=all` was substantially slower, so NUMA policy must be
+measured rather than assumed.
+
 The CPU tests include all BF16 encodings at rounding boundaries, an independent
 enumeration oracle for FP8/FP4, midpoint ties and signed zero, high-position
 RoPE checks, stable pooling and Engram gate direction. A real Q2 run produced
@@ -36,4 +53,14 @@ prompt. This does not yet establish exact logits parity with Metal.
    reject the experimental CPU graph explicitly.
 3. Optimize prompt prefill after decode correctness is established; the current
    implementation deliberately uses the same scalar-token transition.
-4. Measure thread counts and NUMA placement before adding ISA optimizations.
+4. Add CPU stage profiling, then optimize the dominant quantized projections
+   with the available SIMD instruction set.
+
+## Known limitations
+
+- Scalar-token prefill deliberately favors correctness over throughput.
+- Exact logits parity with the Metal quality path has not been measured.
+- Session snapshot serialization is rejected for the CPU V4.1 graph.
+- Vision, tensor parallelism and SSD streaming are not admitted by this path.
+- The implementation must be enabled explicitly with
+  `DS4_CPU_V41_EXPERIMENTAL=1`.

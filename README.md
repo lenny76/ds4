@@ -2,6 +2,11 @@
   <img src="logo.svg" alt="DwarfStar logo" width="220">
 </p>
 
+> **Fork note:** branch `cpu/deepseek-v4.1-flash` adds an experimental CPU
+> inference path for DeepSeek V4.1 Flash. See
+> [docs/CPU_V41.md](docs/CPU_V41.md) for build, usage, validation status and
+> current limitations.
+
 **DwarfStar** aims to be the best way to run a few excellent large
 language models on consumer hardware (that is, hardware that people
 can actually own). To reach this goal, we are building

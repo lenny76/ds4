@@ -547,6 +547,14 @@ tests/test_engram: tests/test_engram.c ds4_engram.c ds4_engram.h
 test-engram: tests/test_engram
 	./tests/test_engram
 
+# Strict floating-point semantics are required by V4.1 activation rounding.
+tests/test_deepseek41_cpu: tests/test_deepseek41_cpu.c ds4_v41_cpu.c ds4_v41_cpu.h
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -ffp-contract=off -I. -o $@ tests/test_deepseek41_cpu.c ds4_v41_cpu.c -lm
+
+.PHONY: test-deepseek41-cpu
+test-deepseek41-cpu: tests/test_deepseek41_cpu
+	./tests/test_deepseek41_cpu
+
 tests/test_deepseek41_gguf.o: tests/test_deepseek41_gguf.c ds4.c ds4.h ds4_engram.h
 	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -Wno-unused-function -DDS4_NO_GPU -I. -c -o $@ $<
 

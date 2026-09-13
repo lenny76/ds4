@@ -91,7 +91,27 @@ fail:
 }
 
 static void ds41c_round(float *x, size_t n) {
-    for (size_t i = 0; i < n; i++) x[i] = ds41_cpu_bf16(x[i]);
+    size_t i = 0;
+#if defined(__AVX512F__)
+    /* ds41_cpu_bf16 lives in another translation unit, so without LTO the
+     * scalar form is one call per element. This repeats its round-to-nearest
+     * even on the top 16 bits in integer lanes, leaving NaN and infinities
+     * alone; it stays the reference the primitive tests check. */
+    const __m512i exp_mask = _mm512_set1_epi32(0x7f800000);
+    const __m512i bias = _mm512_set1_epi32(0x7fff);
+    const __m512i one = _mm512_set1_epi32(1);
+    const __m512i keep = _mm512_set1_epi32((int)0xffff0000u);
+    for (; i + 16 <= n; i += 16) {
+        __m512i b = _mm512_loadu_si512((const void *)(x + i));
+        const __mmask16 finite =
+            _mm512_cmpneq_epi32_mask(_mm512_and_si512(b, exp_mask), exp_mask);
+        const __m512i inc =
+            _mm512_add_epi32(bias, _mm512_and_si512(_mm512_srli_epi32(b, 16), one));
+        b = _mm512_mask_add_epi32(b, finite, b, inc);
+        _mm512_storeu_si512((void *)(x + i), _mm512_and_si512(b, keep));
+    }
+#endif
+    for (; i < n; i++) x[i] = ds41_cpu_bf16(x[i]);
 }
 
 static void ds41c_mat(float *out, const ds4_model *m, const ds4_tensor *t, const float *in, bool round) {

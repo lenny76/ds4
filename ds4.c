@@ -1911,7 +1911,7 @@ static void cpu_directional_steering_project_rows(
 
 typedef void (*ds4_parallel_fn)(void *ctx, uint64_t row0, uint64_t row1);
 
-#define DS4_MAX_THREADS 32
+#define DS4_MAX_THREADS 64
 
 typedef struct {
     pthread_t threads[DS4_MAX_THREADS];
@@ -2004,6 +2004,8 @@ static void ds4_threads_init(void) {
     g_pool.done = 0;
     g_pool.shutdown = false;
     g_pool.initialized = true;
+    if (getenv("DS4_CPU_V41_EXPERIMENTAL"))
+        fprintf(stderr, "ds4: CPU worker threads: %u\n", n_threads);
 
     for (uint32_t i = 1; i < n_threads; i++) {
         if (pthread_create(&g_pool.threads[i], NULL, ds4_worker_main, (void *)(uintptr_t)i) != 0) {

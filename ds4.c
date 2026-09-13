@@ -56646,6 +56646,10 @@ typedef struct {
     uint8_t fingerprint[32];
 } ds4_vision_identity;
 
+#ifdef DS4_V41_CPU_GRAPH
+#include "ds4_v41_cpu_graph.inc"
+#endif
+
 struct ds4_session {
     ds4_engine *engine;
     ds4_dist_session *distributed;
@@ -56678,6 +56682,9 @@ struct ds4_session {
 #endif
     ds4_kv_cache cpu_cache;
     ds4_cpu_decode_scratch cpu_scratch;
+#ifdef DS4_V41_CPU_GRAPH
+    ds41_cpu_graph *v41_cpu;
+#endif
     token_vec checkpoint;
     ds4_vision_identity *checkpoint_images;
     size_t checkpoint_image_count;
@@ -57757,6 +57764,9 @@ static uint64_t session_cpu_payload_live_tensor_bytes(const ds4_session *s) {
 }
 
 static void session_cpu_reset_cache(ds4_session *s) {
+#ifdef DS4_V41_CPU_GRAPH
+    if (s->v41_cpu) { ds41c_reset(s->v41_cpu); return; }
+#endif
     kv_cache_free(&s->cpu_cache);
     kv_cache_init(&s->cpu_cache, (uint32_t)s->ctx_size, 0);
 }
@@ -58870,6 +58880,9 @@ static int ds41_load_payload(ds4_session *s, FILE *fp, const uint32_t *h,
 #endif
 
 uint64_t ds4_session_payload_bytes(ds4_session *s) {
+#ifdef DS4_V41_CPU_GRAPH
+    if (s && s->v41_cpu) return 0;
+#endif
     if (!s || !s->checkpoint_valid) return 0;
     if (s->distributed) return 0;
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
@@ -59005,6 +59018,11 @@ int ds4_session_stage_payload(ds4_session *s, ds4_session_payload_file *out,
 }
 
 int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen) {
+#ifdef DS4_V41_CPU_GRAPH
+    if (s && s->v41_cpu) {
+        payload_set_err(err, errlen, "V4.1 CPU snapshots are not implemented"); return 1;
+    }
+#endif
     if (!s || !fp || !s->checkpoint_valid) {
         payload_set_err(err, errlen, "session has no valid checkpoint to save");
         return 1;
@@ -59348,6 +59366,11 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
 }
 
 int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, char *err, size_t errlen) {
+#ifdef DS4_V41_CPU_GRAPH
+    if (s && s->v41_cpu) {
+        payload_set_err(err, errlen, "V4.1 CPU snapshots are not implemented"); return 1;
+    }
+#endif
     if (!s || !fp) {
         payload_set_err(err, errlen, "invalid session payload load");
         return 1;
@@ -61189,6 +61212,51 @@ int ds4_engine_generate_argmax(
     const ds4_model *model = &e->model;
     const ds4_vocab *vocab = &e->vocab;
     const ds4_weights *weights = &e->weights;
+
+#ifdef DS4_V41_CPU_GRAPH
+    if (e->backend == DS4_BACKEND_CPU &&
+        DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41) {
+        ds4_session *s = NULL;
+        char err[256] = {0};
+        const double t_prefill0 = now_sec();
+        if (ds4_session_create(&s, e, ctx_size) != 0) {
+            fprintf(stderr, "ds4: failed to create V4.1 CPU session\n");
+            return 1;
+        }
+        ds4_session_set_progress(s, progress, progress_ud);
+        if (ds4_session_sync(s, prompt, err, sizeof(err)) != 0) {
+            ds4_session_set_progress(s, NULL, NULL);
+            fprintf(stderr, "ds4: V4.1 CPU prefill failed: %s\n", err);
+            ds4_session_free(s);
+            return 1;
+        }
+        ds4_session_set_progress(s, NULL, NULL);
+        const double t_prefill1 = now_sec();
+        int rc = 0, n_generated = 0;
+        const double t_decode0 = now_sec();
+        int token = ds4_session_argmax(s);
+        for (int i = 0; i < n_predict && ds4_session_pos(s) < ctx_size; i++) {
+            if (token < 0) { rc = 1; break; }
+            if (ds4_token_is_stop(e, token)) break;
+            if (emit) emit(emit_ud, token);
+            n_generated++;
+            if (i == n_predict - 1 || ds4_session_pos(s) + 1 >= ctx_size) break;
+            token = ds4_session_eval_argmax(s, token, err, sizeof(err));
+            if (token < 0) {
+                fprintf(stderr, "ds4: V4.1 CPU decode failed: %s\n", err);
+                rc = 1; break;
+            }
+        }
+        const double t_decode1 = now_sec();
+        if (done) done(emit_ud);
+        ds4_log(stderr, DS4_LOG_TIMING,
+                "ds4: prefill: %.2f t/s, generation: %.2f t/s\n",
+                (t_prefill1 - t_prefill0) > 0.0 ? (double)prompt->len / (t_prefill1 - t_prefill0) : 0.0,
+                (t_decode1 - t_decode0) > 0.0 ? (double)n_generated / (t_decode1 - t_decode0) : 0.0);
+        ds4_session_free(s);
+        return rc;
+    }
+#endif
 
     if (ds4_backend_uses_graph(e->backend)) {
 #ifndef DS4_NO_GPU
@@ -65651,7 +65719,17 @@ static int ds4_engine_open_internal(ds4_engine **out,
     }
     config_validate_model(&e->model);
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 && !opt->inspect_only) {
-        const bool supported = e->backend == DS4_BACKEND_METAL &&
+        bool backend_supported = e->backend == DS4_BACKEND_METAL;
+#ifdef DS4_V41_CPU_GRAPH
+        const char *cpu_experiment = getenv("DS4_CPU_V41_EXPERIMENTAL");
+        if (e->backend == DS4_BACKEND_CPU && cpu_experiment && !strcmp(cpu_experiment, "1") &&
+            opt->context_size > 0 && opt->context_size <= 32768 &&
+            !opt->ssd_streaming && !opt->vision_path && opt->tp.role == DS4_TP_NONE && !opt->tp.requested) {
+            backend_supported = true;
+            fprintf(stderr, "ds4: experimental V4.1 CPU graph; logits parity is not yet validated\n");
+        }
+#endif
+        const bool supported = backend_supported &&
             opt->distributed.role == DS4_DISTRIBUTED_NONE &&
             !load_slice && !opt->dspark && !opt->glm_mtp &&
             !opt->first_token_test && !opt->metal_graph_test &&
@@ -67610,8 +67688,18 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         s->ctx_size = ctx_size;
         s->prefill_cap = ds4_prefill_cap_for_prompt(ctx_size,
                                                      e->prefill_chunk);
-        kv_cache_init(&s->cpu_cache, (uint32_t)ctx_size, 0);
-        cpu_decode_scratch_init(&s->cpu_scratch, (uint32_t)ctx_size);
+#ifdef DS4_V41_CPU_GRAPH
+        if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41) {
+            s->v41_cpu = xcalloc(1, sizeof(*s->v41_cpu));
+            if (!ds41c_alloc(s->v41_cpu, &e->model, e->model_path, (uint32_t)ctx_size)) {
+                ds4_session_free(s); return 1;
+            }
+        } else
+#endif
+        {
+            kv_cache_init(&s->cpu_cache, (uint32_t)ctx_size, 0);
+            cpu_decode_scratch_init(&s->cpu_scratch, (uint32_t)ctx_size);
+        }
         s->logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
         s->sample_probs = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->sample_probs[0]));
         if (!ds4_session_tp_register(s)) {
@@ -67992,6 +68080,9 @@ void ds4_session_free(ds4_session *s) {
     if (ds4_session_is_cpu(s)) {
         kv_cache_free(&s->cpu_cache);
         cpu_decode_scratch_free(&s->cpu_scratch);
+#ifdef DS4_V41_CPU_GRAPH
+        if (s->v41_cpu) { ds41c_free(s->v41_cpu); free(s->v41_cpu); }
+#endif
     }
 #ifndef DS4_NO_GPU
     else {
@@ -69626,6 +69717,28 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                                      err,
                                      errlen);
     }
+#ifdef DS4_V41_CPU_GRAPH
+    if (s->v41_cpu) {
+        ds41_cpu_graph *g = s->v41_cpu;
+        if (!s->checkpoint_valid || !g->valid || g->pos != (uint32_t)s->checkpoint.len ||
+            !ds4_tokens_starts_with(prompt, &s->checkpoint)) {
+            ds41c_reset(g); s->checkpoint.len = 0; s->checkpoint_valid = false;
+        }
+        for (int i = s->checkpoint.len; i < prompt->len; i++) {
+            if (ds4_session_cancelled(s)) {
+                snprintf(err, errlen, "interrupted"); return DS4_SESSION_SYNC_INTERRUPTED;
+            }
+            if (!ds41c_step(g, &s->engine->model, &s->engine->weights, prompt->v[i], s->logits)) {
+                s->checkpoint_valid = false;
+                snprintf(err, errlen, "V4.1 CPU prefill failed at token %d", i); return 1;
+            }
+            token_vec_push(&s->checkpoint, prompt->v[i]); s->checkpoint_valid = true;
+            if (s->progress) s->progress(s->progress_ud, "prefill_chunk", i + 1, prompt->len);
+        }
+        s->mtp_draft_valid = false;
+        return 0;
+    }
+#endif
     if (ds4_session_is_cpu(s)) {
         ds4_engine *e = s->engine;
         if (s->checkpoint_valid &&
@@ -71578,6 +71691,18 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
                                      err,
                                      errlen);
     }
+#ifdef DS4_V41_CPU_GRAPH
+    if (s->v41_cpu) {
+        if (!s->v41_cpu->valid || s->v41_cpu->pos != (uint32_t)s->checkpoint.len ||
+            !ds41c_step(s->v41_cpu, &s->engine->model, &s->engine->weights, token, s->logits)) {
+            s->checkpoint_valid = false;
+            snprintf(err, errlen, "V4.1 CPU decode failed at token %d", s->checkpoint.len); return 1;
+        }
+        token_vec_push(&s->checkpoint, token); s->checkpoint_valid = true;
+        s->mtp_draft_valid = false;
+        return 0;
+    }
+#endif
     if (ds4_session_is_cpu(s)) {
         ds4_engine *e = s->engine;
         forward_token_raw_swa_cpu_decode_scratch(s->logits,

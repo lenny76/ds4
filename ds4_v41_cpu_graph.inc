@@ -118,6 +118,22 @@ static bool ds41c_rope(float *x, uint32_t heads, uint32_t width, uint32_t pos, u
     return ds41_cpu_rope(x, (size_t)heads * width, width, heads, 1, pos, 1, il >= 2, inverse);
 }
 
+typedef struct {
+    float *scores;
+    const float *index_q, *rows, *weights;
+} ds41c_index_score_ctx;
+
+static void ds41c_index_score_worker(void *vctx, uint64_t r0, uint64_t r1) {
+    const ds41c_index_score_ctx *c = vctx;
+    for (uint64_t r = r0; r < r1; r++) {
+        const float *k = c->rows + r * 128;
+        float sum = 0;
+        for (unsigned h = 0; h < 32; h++)
+            sum += fmaxf(dot_f32(c->index_q + h * 128, k, 128) / 64, 0) * c->weights[h];
+        c->scores[r] = sum;
+    }
+}
+
 static void ds41c_sort_indices(int *idx, unsigned n) {
     for (unsigned i = 1; i < n; i++) {
         const int value = idx[i];
@@ -168,12 +184,16 @@ static bool ds41c_attention(ds41_cpu_graph *g, const ds4_model *m, const ds4_lay
         if (!ds41c_rope(g->index_q, 32, 128, pos, il, false) ||
             !ds41_cpu_quantize(g->index_q, 32 * 128, 128, 32, DS41_CPU_FP4_E8M0)) return false;
         ds41c_mat(g->index_weights, m, l->indexer_proj, g->norm, true);
-        for (unsigned r = 0; r < count; r++) {
-            float sum = 0;
-            for (unsigned h = 0; h < 32; h++)
-                sum += fmaxf(dot_f32(g->index_q + h * 128, g->index[owner] + (size_t)r * 128, 128) / 64, 0) * g->index_weights[h];
-            g->scores[r] = sum;
-        }
+        /* Row count tracks context length, so this outgrows every projection
+         * in the layer at long context. Each row is independent. */
+        const ds41c_index_score_ctx score_ctx = {
+            .scores = g->scores, .index_q = g->index_q,
+            .rows = g->index[owner], .weights = g->index_weights,
+        };
+        uint64_t score_min_rows = DS4_PARALLEL_MIN_MACS / (32 * 128);
+        if (score_min_rows == 0) score_min_rows = 1;
+        ds4_parallel_for_min_rows(count, ds41c_index_score_worker,
+                                  (void *)&score_ctx, score_min_rows);
         const unsigned blocks = (count + 7) / 8;
         if (il == 20) {
             for (unsigned b = 0; b < blocks; b++) {
@@ -202,16 +222,10 @@ static bool ds41c_attention(ds41_cpu_graph *g, const ds4_model *m, const ds4_lay
     layer_attention_rows_one(g->heads, m, l, g->q, g->rows, raw + top);
     ds41c_round(g->heads, 64 * 512);
     if (!ds41c_rope(g->heads, 64, 512, pos, il, true)) return false;
-    /* Each output group has its own 4096 -> 1024 matrix. */
-    for (unsigned group = 0; group < 8; group++) {
-        ds4_tensor view = *l->attn_output_a;
-        uint64_t bytes;
-        if (!tensor_nbytes(view.type, 4096, &bytes)) return false;
-        view.abs_offset += (uint64_t)group * 1024 * bytes;
-        view.ndim = 2; view.dim[0] = 4096; view.dim[1] = 1024; view.elements = 4096 * 1024;
-        view.bytes = 1024 * bytes;
-        ds41c_mat(g->low + group * 1024, m, &view, g->heads + group * 4096, true);
-    }
+    /* Each output group has its own 4096 -> 1024 matrix. They are contiguous,
+     * so one grouped dispatch replaces eight pool round trips. */
+    matvec_q8_0_f32_ref_grouped(g->low, m, l->attn_output_a, g->heads, 8, 4096, 1024);
+    ds41c_round(g->low, 8 * 1024);
     ds41c_mat(g->block, m, l->attn_output_b, g->low, true);
     return true;
 }

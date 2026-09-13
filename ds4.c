@@ -2065,6 +2065,11 @@ static void ds4_threads_shutdown(void) {
     memset(&g_pool, 0, sizeof(g_pool));
 }
 
+/* Multiply-accumulates below which a fork-join costs more than it saves. One
+ * pool round trip is tens of microseconds across two sockets; this much work
+ * takes an order of magnitude longer on a single core. */
+#define DS4_PARALLEL_MIN_MACS UINT64_C(262144)
+
 /* Run a row-parallel CPU kernel, falling back to serial execution for small
  * jobs or nested calls where spawning more work would only add latency. */
 static void ds4_parallel_for_min_rows(uint64_t n_rows, ds4_parallel_fn fn, void *ctx, uint64_t min_parallel_rows) {
@@ -8014,7 +8019,7 @@ static void matvec_f16(float *out, const ds4_model *m, const ds4_tensor *w, cons
     };
 
     const uint64_t ops = in_dim * out_dim;
-    const uint64_t min_rows = ops >= 262144 ? 1 : 512;
+    const uint64_t min_rows = ops >= DS4_PARALLEL_MIN_MACS ? 1 : 512;
     ds4_parallel_for_min_rows(out_dim, matvec_f16_worker, &ctx, min_rows);
 }
 
@@ -8111,6 +8116,14 @@ static inline int32_t dot_i8_32(const int8_t *a, const int8_t *b, uint64_t n) {
         acc = vdotq_s32(acc, vld1q_s8(a),      vld1q_s8(b));
         acc = vdotq_s32(acc, vld1q_s8(a + 16), vld1q_s8(b + 16));
         return vaddvq_s32(acc);
+    }
+#elif defined(__AVX512F__) && defined(__AVX512BW__)
+    /* Widen to int16 and use madd: exact, and unlike VNNI's dpbusd it needs no
+     * unsigned bias correction. Cascade Lake has no signed-signed byte dot. */
+    if (n == 32) {
+        const __m512i av = _mm512_cvtepi8_epi16(_mm256_loadu_si256((const __m256i *)a));
+        const __m512i bv = _mm512_cvtepi8_epi16(_mm256_loadu_si256((const __m256i *)b));
+        return _mm512_reduce_add_epi32(_mm512_madd_epi16(av, bv));
     }
 #endif
     int32_t sum = 0;
@@ -8778,13 +8791,32 @@ static void matvec_q8_0(float *out, const ds4_model *m, const ds4_tensor *w, con
     matvec_q8_0_rows(out, m, w, x, 0, w->dim[1]);
 }
 
+/* Keeps the activation in F32 instead of quantizing it to int8, so this stays
+ * the higher-precision path; the vector form only changes accumulation order. */
 static inline float dot_q8_0_row_f32_ref(
         const uint8_t *row,
         const float   *x,
         uint64_t       in_dim,
         uint64_t       blocks) {
+    uint64_t b = 0;
     float acc = 0.0f;
-    for (uint64_t b = 0; b < blocks; b++) {
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+    __m512 acc0 = _mm512_setzero_ps();
+    __m512 acc1 = _mm512_setzero_ps();
+    for (; b < blocks && in_dim - b * 32 >= 32; b++) {
+        uint16_t scale_bits;
+        memcpy(&scale_bits, row + b * 34, sizeof(scale_bits));
+        const __m512 dv = _mm512_set1_ps(f16_to_f32(scale_bits));
+        const __m256i q = _mm256_loadu_si256((const __m256i *)(row + b * 34 + 2));
+        const __m512 q0 = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm256_castsi256_si128(q)));
+        const __m512 q1 = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm256_extracti128_si256(q, 1)));
+        const uint64_t i0 = b * 32;
+        acc0 = _mm512_fmadd_ps(_mm512_mul_ps(dv, q0), _mm512_loadu_ps(x + i0), acc0);
+        acc1 = _mm512_fmadd_ps(_mm512_mul_ps(dv, q1), _mm512_loadu_ps(x + i0 + 16), acc1);
+    }
+    acc = _mm512_reduce_add_ps(_mm512_add_ps(acc0, acc1));
+#endif
+    for (; b < blocks; b++) {
         uint16_t scale_bits;
         memcpy(&scale_bits, row + b * 34, sizeof(scale_bits));
         const int8_t *qs = (const int8_t *)(row + b * 34 + 2);
@@ -8832,7 +8864,71 @@ static void matvec_q8_0_f32_ref(
         .in_dim = w->dim[0],
         .blocks = (w->dim[0] + 31) / 32,
     };
-    ds4_parallel_for(w->elements / w->dim[0], matvec_q8_0_f32_ref_worker, &ctx);
+    /* Admit on total work rather than row count. A fixed row threshold leaves
+     * the V4.1 hyper-connection mixers serial: they emit 24 rows but each one
+     * reads a 20480-element activation, so the row count understates the work
+     * by three orders of magnitude. */
+    const uint64_t rows = w->elements / w->dim[0];
+    uint64_t min_rows = DS4_PARALLEL_MIN_MACS / w->dim[0];
+    if (min_rows == 0) min_rows = 1;
+    ds4_parallel_for_min_rows(rows, matvec_q8_0_f32_ref_worker, &ctx, min_rows);
+}
+
+typedef struct {
+    float *out;
+    const uint8_t *data;
+    const float *x;
+    uint64_t in_dim;
+    uint64_t blocks;
+    uint64_t rows_per_group;
+    uint64_t group_bytes;
+} matvec_q8_0_f32_ref_grouped_ctx;
+
+static void matvec_q8_0_f32_ref_grouped_worker(void *vctx, uint64_t r0, uint64_t r1) {
+    matvec_q8_0_f32_ref_grouped_ctx *ctx = vctx;
+    const uint64_t row_bytes = ctx->blocks * 34;
+    for (uint64_t r = r0; r < r1; r++) {
+        const uint64_t group = r / ctx->rows_per_group;
+        const uint64_t row = r - group * ctx->rows_per_group;
+        ctx->out[r] = dot_q8_0_row_f32_ref(
+            ctx->data + group * ctx->group_bytes + row * row_bytes,
+            ctx->x + group * ctx->in_dim,
+            ctx->in_dim,
+            ctx->blocks);
+    }
+}
+
+/* Block-diagonal Q8_0 matvec: `groups` independent in_dim -> rows_per_group
+ * matrices stored back to back, each reading its own slice of x. Fusing them
+ * into one dispatch replaces one pool round trip per group with one total. */
+static void matvec_q8_0_f32_ref_grouped(
+        float            *out,
+        const ds4_model  *m,
+        const ds4_tensor *w,
+        const float      *x,
+        uint64_t          groups,
+        uint64_t          in_dim,
+        uint64_t          rows_per_group) {
+    if (w->type != DS4_TENSOR_Q8_0 || in_dim == 0 || groups == 0) {
+        ds4_die("expected a Q8_0 tensor with grouped matrix rows");
+    }
+    uint64_t row_bytes;
+    if (!tensor_nbytes(w->type, in_dim, &row_bytes)) ds4_die("Q8_0 group row size overflow");
+    const uint64_t total = groups * rows_per_group;
+    if (w->bytes < total * row_bytes) ds4_die("Q8_0 grouped view is outside the tensor");
+
+    matvec_q8_0_f32_ref_grouped_ctx ctx = {
+        .out = out,
+        .data = tensor_data(m, w),
+        .x = x,
+        .in_dim = in_dim,
+        .blocks = (in_dim + 31) / 32,
+        .rows_per_group = rows_per_group,
+        .group_bytes = rows_per_group * row_bytes,
+    };
+    uint64_t min_rows = DS4_PARALLEL_MIN_MACS / in_dim;
+    if (min_rows == 0) min_rows = 1;
+    ds4_parallel_for_min_rows(total, matvec_q8_0_f32_ref_grouped_worker, &ctx, min_rows);
 }
 
 static void matvec_any(float *out, const ds4_model *m, const ds4_tensor *w, const float *x);
@@ -11551,7 +11647,23 @@ static void rope_tail_layer_batch_inplace(
 }
 
 static inline float dot_f32(const float *a, const float *b, uint32_t n) {
-#if defined(__ARM_NEON)
+#if defined(__AVX512F__)
+    __m512 acc0 = _mm512_setzero_ps();
+    __m512 acc1 = _mm512_setzero_ps();
+    uint32_t i = 0;
+    for (; i + 32 <= n; i += 32) {
+        acc0 = _mm512_fmadd_ps(_mm512_loadu_ps(a + i),      _mm512_loadu_ps(b + i),      acc0);
+        acc1 = _mm512_fmadd_ps(_mm512_loadu_ps(a + i + 16), _mm512_loadu_ps(b + i + 16), acc1);
+    }
+    for (; i + 16 <= n; i += 16)
+        acc0 = _mm512_fmadd_ps(_mm512_loadu_ps(a + i), _mm512_loadu_ps(b + i), acc0);
+    if (i < n) {
+        const __mmask16 tail = (__mmask16)((1u << (n - i)) - 1u);
+        acc1 = _mm512_fmadd_ps(_mm512_maskz_loadu_ps(tail, a + i),
+                               _mm512_maskz_loadu_ps(tail, b + i), acc1);
+    }
+    return _mm512_reduce_add_ps(_mm512_add_ps(acc0, acc1));
+#elif defined(__ARM_NEON)
     uint32_t i = 0;
     float32x4_t acc0 = vdupq_n_f32(0.0f);
     float32x4_t acc1 = vdupq_n_f32(0.0f);
@@ -11570,7 +11682,19 @@ static inline float dot_f32(const float *a, const float *b, uint32_t n) {
 }
 
 static inline void axpy_f32(float *y, const float *x, float a, uint32_t n) {
-#if defined(__ARM_NEON)
+#if defined(__AVX512F__)
+    const __m512 av = _mm512_set1_ps(a);
+    uint32_t i = 0;
+    for (; i + 16 <= n; i += 16)
+        _mm512_storeu_ps(y + i, _mm512_fmadd_ps(av, _mm512_loadu_ps(x + i),
+                                                _mm512_loadu_ps(y + i)));
+    if (i < n) {
+        const __mmask16 tail = (__mmask16)((1u << (n - i)) - 1u);
+        _mm512_mask_storeu_ps(y + i, tail,
+                              _mm512_fmadd_ps(av, _mm512_maskz_loadu_ps(tail, x + i),
+                                              _mm512_maskz_loadu_ps(tail, y + i)));
+    }
+#elif defined(__ARM_NEON)
     uint32_t i = 0;
     const float32x4_t av = vdupq_n_f32(a);
     for (; i + 8 <= n; i += 8) {

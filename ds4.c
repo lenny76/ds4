@@ -7989,6 +7989,22 @@ static inline float dot_f16_row(const uint16_t *row, const float *x, uint64_t n)
     float acc = vaddvq_f32(vaddq_f32(acc0, acc1));
     for (; i < n; i++) acc += f16_to_f32(row[i]) * x[i];
     return acc;
+#elif defined(__AVX512F__)
+    __m512 acc0 = _mm512_setzero_ps();
+    __m512 acc1 = _mm512_setzero_ps();
+    uint64_t i = 0;
+    for (; i + 32 <= n; i += 32) {
+        acc0 = _mm512_fmadd_ps(_mm512_cvtph_ps(_mm256_loadu_si256((const __m256i *)(row + i))),
+                               _mm512_loadu_ps(x + i), acc0);
+        acc1 = _mm512_fmadd_ps(_mm512_cvtph_ps(_mm256_loadu_si256((const __m256i *)(row + i + 16))),
+                               _mm512_loadu_ps(x + i + 16), acc1);
+    }
+    for (; i + 16 <= n; i += 16)
+        acc0 = _mm512_fmadd_ps(_mm512_cvtph_ps(_mm256_loadu_si256((const __m256i *)(row + i))),
+                               _mm512_loadu_ps(x + i), acc0);
+    float acc = _mm512_reduce_add_ps(_mm512_add_ps(acc0, acc1));
+    for (; i < n; i++) acc += f16_to_f32(row[i]) * x[i];
+    return acc;
 #else
     float acc = 0.0f;
     for (uint64_t i = 0; i < n; i++) acc += f16_to_f32(row[i]) * x[i];

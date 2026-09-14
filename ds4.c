@@ -1188,6 +1188,51 @@ static inline DS4_MAYBE_UNUSED int32_t dot_q2_16(const uint8_t *q2, const int8_t
 #endif
 }
 
+#if defined(__AVX512VNNI__) && defined(__AVX512VL__)
+/* Wider forms of the two kernels above: 32 values per call instead of 16, and
+ * the per-call horizontal reduction is replaced by a lane accumulator the
+ * caller drains once per block. Integer throughout, so results are unchanged. */
+
+static inline int32_t hsum256_epi32(__m256i v) {
+    const __m128i s = _mm_add_epi32(_mm256_castsi256_si128(v),
+                                    _mm256_extracti128_si256(v, 1));
+    const __m128i t = _mm_add_epi32(s, _mm_shuffle_epi32(s, 0x4e));
+    return _mm_cvtsi128_si32(_mm_add_epi32(t, _mm_shuffle_epi32(t, 0xb1)));
+}
+
+static inline __m256i dot_iq2_quad_32(const int8_t *g0, const int8_t *g1,
+                                      const int8_t *g2, const int8_t *g3,
+                                      const int8_t *q8) {
+    const __m128i lo = _mm_unpacklo_epi64(_mm_loadl_epi64((const __m128i *)g0),
+                                          _mm_loadl_epi64((const __m128i *)g1));
+    const __m128i hi = _mm_unpacklo_epi64(_mm_loadl_epi64((const __m128i *)g2),
+                                          _mm_loadl_epi64((const __m128i *)g3));
+    const __m256i gv = _mm256_xor_si256(_mm256_set_m128i(hi, lo),
+                                        _mm256_set1_epi8((char)0x80));
+    const __m256i qv = _mm256_loadu_si256((const __m256i *)q8);
+    const __m256i prod = _mm256_dpbusd_epi32(_mm256_setzero_si256(), gv, qv);
+    const __m256i pairs = _mm256_maddubs_epi16(_mm256_set1_epi8(1), qv);
+    const __m256i qsum4 = _mm256_madd_epi16(pairs, _mm256_set1_epi16(1));
+    return _mm256_sub_epi32(prod, _mm256_slli_epi32(qsum4, 7));
+}
+
+/* Lanes 0-3 cover q2/q8 bytes 0-15, lanes 4-7 cover bytes 16-31, so the two
+ * halves keep the separate Q2_K sub-block scales the caller applies. */
+static inline __m256i dot_q2_32(const uint8_t *q2, const int8_t *q8, int shift) {
+    const __m256i packed = _mm256_loadu_si256((const __m256i *)q2);
+    __m256i shifted;
+    switch (shift) {
+    case 0: shifted = packed; break;
+    case 2: shifted = _mm256_srli_epi16(packed, 2); break;
+    case 4: shifted = _mm256_srli_epi16(packed, 4); break;
+    default: shifted = _mm256_srli_epi16(packed, 6); break;
+    }
+    const __m256i vals = _mm256_and_si256(shifted, _mm256_set1_epi8(3));
+    return _mm256_dpbusd_epi32(_mm256_setzero_si256(), vals,
+                               _mm256_loadu_si256((const __m256i *)q8));
+}
+#endif
+
 /* =========================================================================
  * Shared Helpers, Allocation Guards, Threads, and Cursor Reads.
  * =========================================================================
@@ -3805,6 +3850,23 @@ static void ds4_vec_dot_q2_K_q8_K(int n, float *s, const block_q2_K *x, const bl
 
         int isum = 0;
         int is = 0;
+#if defined(__AVX512VNNI__) && defined(__AVX512VL__)
+        __m256i iacc = _mm256_setzero_si256();
+        for (int k = 0; k < QK_K / 128; k++) {
+            int shift = 0;
+            for (int j = 0; j < 4; j++) {
+                const int d0 = sc[is++] & 0x0f;
+                const int d1 = sc[is++] & 0x0f;
+                iacc = _mm256_add_epi32(iacc,
+                    _mm256_mullo_epi32(dot_q2_32(q2, q8, shift),
+                                       _mm256_setr_epi32(d0, d0, d0, d0, d1, d1, d1, d1)));
+                shift += 2;
+                q8 += 32;
+            }
+            q2 += 32;
+        }
+        isum = hsum256_epi32(iacc);
+#else
         for (int k = 0; k < QK_K / 128; k++) {
             int shift = 0;
             for (int j = 0; j < 4; j++) {
@@ -3821,6 +3883,7 @@ static void ds4_vec_dot_q2_K_q8_K(int n, float *s, const block_q2_K *x, const bl
             }
             q2 += 32;
         }
+#endif
         sumf += dall * (float)isum - dmin * (float)summs;
     }
     *s = sumf;
@@ -4331,6 +4394,25 @@ static DS4_MAYBE_UNUSED void ds4_vec_dot_iq2_xxs_q8_K(int n, float *s, const blo
         const int8_t *q8 = y[i].qs;
         int32_t bsum = 0;
 
+#if defined(__AVX512VNNI__) && defined(__AVX512VL__)
+        __m256i bacc = _mm256_setzero_si256();
+        for (int ib32 = 0; ib32 < QK_K / 32; ib32++) {
+            memcpy(aux32, q2, 2 * sizeof(uint32_t));
+            q2 += 4;
+
+            const uint32_t ls = 2 * (aux32[1] >> 28) + 1;
+            const __m256i prod = dot_iq2_quad_32(
+                iq2xxs_signed_grid[aux8[0]][(aux32[1] >>  0) & 127],
+                iq2xxs_signed_grid[aux8[1]][(aux32[1] >>  7) & 127],
+                iq2xxs_signed_grid[aux8[2]][(aux32[1] >> 14) & 127],
+                iq2xxs_signed_grid[aux8[3]][(aux32[1] >> 21) & 127],
+                q8);
+            bacc = _mm256_add_epi32(bacc,
+                _mm256_mullo_epi32(prod, _mm256_set1_epi32((int)ls)));
+            q8 += 32;
+        }
+        bsum += hsum256_epi32(bacc);
+#else
         for (int ib32 = 0; ib32 < QK_K / 32; ib32++) {
             memcpy(aux32, q2, 2 * sizeof(uint32_t));
             q2 += 4;
@@ -4347,6 +4429,7 @@ static DS4_MAYBE_UNUSED void ds4_vec_dot_iq2_xxs_q8_K(int n, float *s, const blo
             }
             bsum += sumi * (int32_t)ls;
         }
+#endif
         sumf += d * (float)bsum;
     }
     *s = 0.125f * sumf;

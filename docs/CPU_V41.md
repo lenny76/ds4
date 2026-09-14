@@ -5,6 +5,9 @@ checkpoint prefill and decode have been validated on the development server;
 cross-backend logits parity is still pending. The graph remains behind
 `DS4_CPU_V41_EXPERIMENTAL=1`, so `make cpu` alone does not opt into V4.1.
 
+The measured optimization history is tracked in
+[`CPU_V41_PERFORMANCE.md`](CPU_V41_PERFORMANCE.md).
+
 On x86-64, `make cpu` uses `-march=native`. CPUs exposing AVX-512 VNNI and
 AVX-512 VL therefore use exact integer VNNI kernels for the IQ2_XXS and Q2_K
 expert projections; other x86 CPUs retain the scalar implementation.

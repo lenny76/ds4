@@ -1,6 +1,6 @@
 # DeepSeek V4.1 CPU port: development status
 
-This branch contains an experimental scalar-token V4.1 CPU graph. Real Q2
+This branch contains an experimental V4.1 CPU graph with layer-major prompt batching and a scalar-token decode transition. Real Q2
 checkpoint prefill and decode have been validated on the development server;
 cross-backend logits parity is still pending. The graph remains behind
 `DS4_CPU_V41_EXPERIMENTAL=1`, so `make cpu` alone does not opt into V4.1.
@@ -55,14 +55,12 @@ prompt. This does not yet establish exact logits parity with Metal.
    before removing the experimental admission gate.
 2. Add snapshot serialization for the V4.1 cache state. Snapshot APIs currently
    reject the experimental CPU graph explicitly.
-3. Optimize prompt prefill after decode correctness is established; the current
-   implementation deliberately uses the same scalar-token transition.
-4. Optimize attention projections, now the largest stable warm-cache CPU cost
-   after the routed-expert VNNI kernels.
+3. Extend exact batching to the routed experts; the existing generic grouped
+   implementation changes V4.1 reduction order and therefore cannot be reused.
+4. Compare batch sizes and attention growth at 4096 tokens.
 
 ## Known limitations
 
-- Scalar-token prefill deliberately favors correctness over throughput.
 - Exact logits parity with the Metal quality path has not been measured.
 - Session snapshot serialization is rejected for the CPU V4.1 graph.
 - Vision, tensor parallelism and SSD streaming are not admitted by this path.
@@ -87,3 +85,17 @@ array, while preserving the earlier-row tie rule and final position order.
 Tie-heavy randomized tests compare the selected set against the reference
 algorithm. At 2048 tokens this improved decode from 3.24 to 3.32 t/s on the
 reference host.
+
+## CPU prompt batching
+
+Prompt synchronization processes up to 16 tokens layer by layer. Q8_0 attention
+projections and the shared expert keep each weight row hot across the token
+batch while preserving F32 activations, BF16 boundaries, causal cache
+publication, and per-token KV selections. A full-model test compares both the
+final prompt logits and a continuation step against the scalar-token graph.
+
+On the reference dual-socket Xeon host, 512-token prefill improved from 3.69 to
+6.13 t/s (+66%), and batch-8 reached 5.20 t/s at 2048 tokens versus about 3.50
+t/s for scalar-token prefill. Set `DS4_CPU_V41_DISABLE_BATCH_PREFILL=1` for an
+A/B rollback, or `DS4_CPU_V41_BATCH_PREFILL=N` to test a size from 2 through 16.
+The rollback variable takes precedence. Decode still uses `ds41c_step`.

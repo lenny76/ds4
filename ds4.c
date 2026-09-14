@@ -9017,6 +9017,49 @@ typedef struct {
     float *out;
     const uint8_t *data;
     const float *x;
+    uint64_t n_tok;
+    uint64_t in_dim;
+    uint64_t out_dim;
+    uint64_t blocks;
+} matmul_q8_0_f32_ref_ctx;
+
+static void matmul_q8_0_f32_ref_worker(void *vctx, uint64_t r0, uint64_t r1) {
+    matmul_q8_0_f32_ref_ctx *ctx = vctx;
+    const uint64_t row_bytes = ctx->blocks * 34;
+    for (uint64_t r = r0; r < r1; r++) {
+        const uint8_t *row = ctx->data + r * row_bytes;
+        /* Keep a weight row hot while applying it to the prompt rows. Each
+         * individual dot product retains the decode path's accumulation
+         * order and its F32 activation; only the traversal across tokens is
+         * changed. */
+        for (uint64_t t = 0; t < ctx->n_tok; t++)
+            ctx->out[t * ctx->out_dim + r] = dot_q8_0_row_f32_ref(
+                row, ctx->x + t * ctx->in_dim, ctx->in_dim, ctx->blocks);
+    }
+}
+
+static void matmul_q8_0_f32_ref(
+        float            *out,
+        const ds4_model  *m,
+        const ds4_tensor *w,
+        const float      *x,
+        uint64_t          n_tok) {
+    if (w->type != DS4_TENSOR_Q8_0 || w->ndim < 2 || w->dim[0] == 0 || !n_tok)
+        ds4_die("expected a Q8_0 tensor with matrix rows and a nonempty batch");
+    matmul_q8_0_f32_ref_ctx ctx = {
+        .out = out, .data = tensor_data(m, w), .x = x, .n_tok = n_tok,
+        .in_dim = w->dim[0], .out_dim = w->elements / w->dim[0],
+        .blocks = (w->dim[0] + 31) / 32,
+    };
+    uint64_t min_rows = DS4_PARALLEL_MIN_MACS / (w->dim[0] * n_tok);
+    if (min_rows == 0) min_rows = 1;
+    ds4_parallel_for_min_rows(ctx.out_dim, matmul_q8_0_f32_ref_worker, &ctx, min_rows);
+}
+
+typedef struct {
+    float *out;
+    const uint8_t *data;
+    const float *x;
     uint64_t in_dim;
     uint64_t blocks;
     uint64_t rows_per_group;
@@ -70076,19 +70119,35 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
             !ds4_tokens_starts_with(prompt, &s->checkpoint)) {
             ds41c_reset(g); s->checkpoint.len = 0; s->checkpoint_valid = false;
         }
-        for (int i = s->checkpoint.len; i < prompt->len; i++) {
+        for (int i = s->checkpoint.len; i < prompt->len;) {
             if (ds4_session_cancelled(s)) {
                 snprintf(err, errlen, "interrupted"); return DS4_SESSION_SYNC_INTERRUPTED;
             }
+            unsigned chunk = getenv("DS4_CPU_V41_DISABLE_BATCH_PREFILL") ? 1u : 16u;
+            const char *batch_env = getenv("DS4_CPU_V41_BATCH_PREFILL");
+            if (chunk > 1 && batch_env) {
+                char *end = NULL;
+                unsigned long requested = strtoul(batch_env, &end, 10);
+                if (end != batch_env && !*end && requested >= 2) chunk = (unsigned)requested;
+                if (chunk > 16) chunk = 16;
+            }
+            const unsigned left = (unsigned)(prompt->len - i);
+            if (chunk > left) chunk = left;
             /* Only the final prompt token's logits are ever read, and the
              * output head is a full vocabulary projection. */
-            float *step_logits = (i + 1 == prompt->len) ? s->logits : NULL;
-            if (!ds41c_step(g, &s->engine->model, &s->engine->weights, prompt->v[i], step_logits)) {
+            float *step_logits = (i + (int)chunk == prompt->len) ? s->logits : NULL;
+            const bool ok = chunk > 1 ?
+                ds41c_prefill_chunk(g, &s->engine->model, &s->engine->weights,
+                                     prompt->v + i, chunk, step_logits) :
+                ds41c_step(g, &s->engine->model, &s->engine->weights,
+                           prompt->v[i], step_logits);
+            if (!ok) {
                 s->checkpoint_valid = false;
                 snprintf(err, errlen, "V4.1 CPU prefill failed at token %d", i); return 1;
             }
-            token_vec_push(&s->checkpoint, prompt->v[i]); s->checkpoint_valid = true;
-            if (s->progress) s->progress(s->progress_ud, "prefill_chunk", i + 1, prompt->len);
+            for (unsigned t = 0; t < chunk; t++) token_vec_push(&s->checkpoint, prompt->v[i + t]);
+            i += (int)chunk; s->checkpoint_valid = true;
+            if (s->progress) s->progress(s->progress_ud, "prefill_chunk", i, prompt->len);
         }
         s->mtp_draft_valid = false;
         return 0;

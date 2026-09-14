@@ -217,15 +217,18 @@ static void ds41c_topk_indices_heap(const float *score, unsigned n,
     ds41c_sort_indices(idx, k);
 }
 
-static bool ds41c_attention(ds41_cpu_graph *g, const ds4_model *m, const ds4_layer_weights *l, uint32_t il) {
+static bool ds41c_attention(ds41_cpu_graph *g, const ds4_model *m, const ds4_layer_weights *l,
+                              uint32_t il, bool projected) {
     const uint32_t pos = g->pos, ratio = ds4_layer_compress_ratio(il);
     const unsigned owner = il < 8 ? 0 : il < 14 ? 1 : il < 20 ? 2 : 3;
     const uint32_t count = ratio ? (pos + 1) / ratio : 0;
-    ds41c_mat(g->qr, m, l->attn_q_a, g->norm, true);
-    ds41c_norm(g->qr, g->qr, m, l->attn_q_a_norm);
-    ds41c_mat(g->q, m, l->attn_q_b, g->qr, true);
-    ds41c_mat(g->kv, m, l->attn_kv, g->norm, true);
-    ds41c_norm(g->kv, g->kv, m, l->attn_kv_a_norm);
+    if (!projected) {
+        ds41c_mat(g->qr, m, l->attn_q_a, g->norm, true);
+        ds41c_norm(g->qr, g->qr, m, l->attn_q_a_norm);
+        ds41c_mat(g->q, m, l->attn_q_b, g->qr, true);
+        ds41c_mat(g->kv, m, l->attn_kv, g->norm, true);
+        ds41c_norm(g->kv, g->kv, m, l->attn_kv_a_norm);
+    }
     if (!ds41c_rope(g->q, 64, 512, pos, il, false) || !ds41c_rope(g->kv, 1, 512, pos, il, false) ||
         !ds41_cpu_quantize(g->kv, 512, 512, 1, DS41_CPU_FP8_E8M0)) return false;
     memcpy(g->window[il] + (pos % 128) * 512, g->kv, sizeof(g->kv));
@@ -321,6 +324,155 @@ static void ds41c_moe(ds41_cpu_graph *g, const ds4_model *m, const ds4_layer_wei
     if (profile) *routed_sec += now_sec() - started;
 }
 
+static void ds41c_mat_batch(float *out, const ds4_model *m, const ds4_tensor *w,
+                              const float *in, uint32_t count, bool round) {
+    if (w->type == DS4_TENSOR_Q8_0) matmul_q8_0_f32_ref(out, m, w, in, count);
+    else for (uint32_t t = 0; t < count; t++)
+        matvec_any(out + (uint64_t)t * w->dim[1], m, w,
+                   in + (uint64_t)t * w->dim[0]);
+    if (round) ds41c_round(out, (size_t)count * w->dim[1]);
+}
+
+/* Layer-major prompt chunk. Dense Q8 projections scan each weight row once
+ * for several F32 activations. Cache publication stays token ordered inside
+ * every layer, preserving causal visibility and the decode graph's numeric
+ * boundaries. */
+static bool ds41c_prefill_chunk(ds41_cpu_graph *g, const ds4_model *m,
+                                const ds4_weights *w, const int *token,
+                                uint32_t count, float *logits) {
+    if (!count || count > 16 || !g->valid || g->pos + count > g->ctx) return false;
+    const uint64_t hc = 4u * DS4_N_EMBD, e = DS4_N_EMBD;
+#define BALLOC(name, n) float *name = calloc((size_t)(n), sizeof(float));
+    BALLOC(residual, (uint64_t)count * hc) BALLOC(after, (uint64_t)count * hc)
+    BALLOC(norm, (uint64_t)count * e) BALLOC(block, (uint64_t)count * e)
+    BALLOC(shared, (uint64_t)count * e) BALLOC(qr, (uint64_t)count * DS4_N_LORA_Q)
+    BALLOC(q, (uint64_t)count * 64u * 512u) BALLOC(kv, (uint64_t)count * 512u)
+    BALLOC(gate, (uint64_t)count * DS4_N_FF_EXP) BALLOC(up, (uint64_t)count * DS4_N_FF_EXP)
+    BALLOC(mid, (uint64_t)count * DS4_N_FF_EXP) BALLOC(pre, (uint64_t)count * 4u)
+    BALLOC(attn_split, (uint64_t)count * 24u) BALLOC(ffn_split, (uint64_t)count * 24u)
+    BALLOC(disk, (uint64_t)count * 2u * 24u * 256u)
+#undef BALLOC
+    int *selected = calloc((size_t)count * 512u, sizeof(int));
+    bool *allowed = calloc((size_t)count * ((g->ctx + 7u) / 8u), sizeof(bool));
+    bool ok = residual && after && norm && block && shared && qr && q && kv && gate && up &&
+              mid && pre && attn_split && ffn_split && disk && selected && allowed;
+    const uint32_t initial = g->pos, allowed_stride = (g->ctx + 7u) / 8u;
+    ds4_engram_history history = g->history;
+    g->valid = false;
+    for (uint32_t t = 0; ok && t < count; t++) {
+        uint32_t ids[2][24];
+        ok = token[t] >= 0 && (uint32_t)token[t] < DS4_N_VOCAB &&
+             ds4_engram_hash(&g->engram, &history, token + t, NULL, 1, &ids[0][0]);
+        for (unsigned table = 0; ok && table < 2; table++)
+            ok = ds4_engram_read(&g->tables[table], ids[table], 24,
+                disk + ((uint64_t)t * 2u + table) * 24u * 256u);
+        if (ok) {
+            embed_token_any(m, w, token[t], g->x);
+            hc_from_plain_embedding(residual + (uint64_t)t * hc, g->x, DS4_N_EMBD, 4);
+            pre[(uint64_t)t * 4u] = 1.0f;
+        }
+    }
+    for (unsigned il = 0; ok && il < 40; il++) {
+        const ds4_layer_weights *l = &w->layer[il];
+        for (uint32_t t = 0; ok && t < count; t++) {
+            memcpy(g->residual, residual + (uint64_t)t * hc, hc * sizeof(float));
+            memcpy(g->pre, pre + (uint64_t)t * 4u, 4u * sizeof(float));
+            if (ds41_engram_layer(il)) {
+                const unsigned table = il == 1 ? 0 : 1;
+                memcpy(g->disk_rows[table], disk + ((uint64_t)t * 2u + table) * 24u * 256u,
+                       sizeof(g->disk_rows[table]));
+                ds41c_mat(g->engram_kv, m, l->engram_kv, g->disk_rows[table], true);
+                ds41_cpu_engram_add(g->residual, g->engram_kv,
+                    tensor_data(m, l->engram_q_norm), tensor_data(m, l->engram_k_norm),
+                    DS4_N_EMBD, DS4_RMS_EPS);
+                memcpy(residual + (uint64_t)t * hc, g->residual, hc * sizeof(float));
+            }
+            ds41c_hc(g, m, l, false);
+            hc_weighted_sum_one(g->x, g->residual, g->pre, DS4_N_EMBD, 4);
+            ds41c_round(g->x, DS4_N_EMBD);
+            ds41c_norm(norm + (uint64_t)t * e, g->x, m, l->attn_norm);
+            memcpy(attn_split + (uint64_t)t * 24u, g->attn_split, 24u * sizeof(float));
+        }
+        ds41c_mat_batch(qr, m, l->attn_q_a, norm, count, true);
+        for (uint32_t t = 0; t < count; t++)
+            ds41c_norm(qr + (uint64_t)t * DS4_N_LORA_Q,
+                       qr + (uint64_t)t * DS4_N_LORA_Q, m, l->attn_q_a_norm);
+        ds41c_mat_batch(q, m, l->attn_q_b, qr, count, true);
+        ds41c_mat_batch(kv, m, l->attn_kv, norm, count, true);
+        for (uint32_t t = 0; t < count; t++)
+            ds41c_norm(kv + (uint64_t)t * 512u, kv + (uint64_t)t * 512u,
+                       m, l->attn_kv_a_norm);
+        for (uint32_t t = 0; ok && t < count; t++) {
+            g->pos = initial + t;
+            memcpy(g->norm, norm + (uint64_t)t * e, e * sizeof(float));
+            memcpy(g->qr, qr + (uint64_t)t * DS4_N_LORA_Q, DS4_N_LORA_Q * sizeof(float));
+            memcpy(g->q, q + (uint64_t)t * 64u * 512u, 64u * 512u * sizeof(float));
+            memcpy(g->kv, kv + (uint64_t)t * 512u, 512u * sizeof(float));
+            memcpy(g->selected, selected + (uint64_t)t * 512u, 512u * sizeof(int));
+            memcpy(g->block_allowed, allowed + (uint64_t)t * allowed_stride,
+                   allowed_stride * sizeof(bool));
+            ok = ds41c_attention(g, m, l, il, true);
+            if (ok) {
+                memcpy(block + (uint64_t)t * e, g->block, e * sizeof(float));
+                memcpy(selected + (uint64_t)t * 512u, g->selected, 512u * sizeof(int));
+                memcpy(allowed + (uint64_t)t * allowed_stride, g->block_allowed,
+                       allowed_stride * sizeof(bool));
+            }
+        }
+        for (uint32_t t = 0; ok && t < count; t++) {
+            memcpy(g->residual, residual + (uint64_t)t * hc, hc * sizeof(float));
+            memcpy(g->block, block + (uint64_t)t * e, e * sizeof(float));
+            memcpy(g->attn_split, attn_split + (uint64_t)t * 24u, 24u * sizeof(float));
+            hc_post_one(g->after, g->block, g->residual, g->attn_split + 4,
+                        g->attn_split + 8, DS4_N_EMBD, 4);
+            ds41c_round(g->after, hc);
+            memcpy(after + (uint64_t)t * hc, g->after, hc * sizeof(float));
+            ds41c_hc(g, m, l, true);
+            hc_weighted_sum_one(g->x, g->after, g->attn_split, DS4_N_EMBD, 4);
+            ds41c_round(g->x, DS4_N_EMBD);
+            ds41c_norm(norm + (uint64_t)t * e, g->x, m, l->ffn_norm);
+            memcpy(ffn_split + (uint64_t)t * 24u, g->ffn_split, 24u * sizeof(float));
+        }
+        ds41c_mat_batch(gate, m, l->ffn_gate_shexp, norm, count, true);
+        ds41c_mat_batch(up, m, l->ffn_up_shexp, norm, count, true);
+        for (uint32_t t = 0; t < count; t++) {
+            swiglu(mid + (uint64_t)t * DS4_N_FF_EXP,
+                   gate + (uint64_t)t * DS4_N_FF_EXP,
+                   up + (uint64_t)t * DS4_N_FF_EXP, DS4_N_FF_EXP, DS4_SWIGLU_CLAMP_EXP);
+            ds41c_round(mid + (uint64_t)t * DS4_N_FF_EXP, DS4_N_FF_EXP);
+        }
+        ds41c_mat_batch(shared, m, l->ffn_down_shexp, mid, count, true);
+        for (uint32_t t = 0; ok && t < count; t++) {
+            layer_routed_moe_one(g->block, m, l, norm + (uint64_t)t * e,
+                                 il, token[t], DS4_SWIGLU_CLAMP_EXP, false);
+            for (unsigned d = 0; d < DS4_N_EMBD; d++)
+                g->block[d] = ds41_cpu_bf16(g->block[d] + shared[(uint64_t)t * e + d]);
+            hc_post_one(residual + (uint64_t)t * hc, g->block,
+                        after + (uint64_t)t * hc, ffn_split + (uint64_t)t * 24u + 4,
+                        ffn_split + (uint64_t)t * 24u + 8, DS4_N_EMBD, 4);
+            ds41c_round(residual + (uint64_t)t * hc, hc);
+            memcpy(pre + (uint64_t)t * 4u, ffn_split + (uint64_t)t * 24u, 4u * sizeof(float));
+        }
+    }
+    if (ok) {
+        const uint32_t last = count - 1;
+        memcpy(g->residual, residual + (uint64_t)last * hc, hc * sizeof(float));
+        memcpy(g->pre, pre + (uint64_t)last * 4u, 4u * sizeof(float));
+        if (logits) {
+            hc_weighted_sum_one(g->x, g->residual, g->pre, DS4_N_EMBD, 4);
+            ds41c_round(g->x, DS4_N_EMBD); ds41c_norm(g->norm, g->x, m, w->output_norm);
+            ds41c_mat(logits, m, w->output, g->norm, false);
+            for (unsigned i = 0; i < DS4_N_VOCAB; i++) if (!isfinite(logits[i])) ok = false;
+        }
+    }
+    if (ok) { g->history = history; g->pos = initial + count; g->valid = true; }
+    else { g->pos = initial; g->valid = false; }
+    free(allowed); free(selected); free(disk); free(ffn_split); free(attn_split); free(pre);
+    free(mid); free(up); free(gate); free(kv); free(q); free(qr); free(shared); free(block);
+    free(norm); free(after); free(residual);
+    return ok;
+}
+
 static bool ds41c_step(ds41_cpu_graph *g, const ds4_model *m, const ds4_weights *w, int token, float *logits) {
     if (!g->valid || g->pos >= g->ctx || token < 0 || (uint32_t)token >= DS4_N_VOCAB) return false;
     const bool profile = getenv("DS4_CPU_V41_PROFILE") != NULL;
@@ -351,7 +503,7 @@ static bool ds41c_step(ds41_cpu_graph *g, const ds4_model *m, const ds4_weights 
         ds41c_round(g->x, DS4_N_EMBD); ds41c_norm(g->norm, g->x, m, l->attn_norm);
         if (profile) attn_hc_sec += now_sec() - started;
         started = profile ? now_sec() : 0.0;
-        if (!ds41c_attention(g, m, l, il)) return false;
+        if (!ds41c_attention(g, m, l, il, false)) return false;
         if (profile) attn_sec += now_sec() - started;
         started = profile ? now_sec() : 0.0;
         hc_post_one(g->after, g->block, g->residual, g->attn_split + 4, g->attn_split + 8, DS4_N_EMBD, 4);

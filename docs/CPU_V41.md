@@ -80,3 +80,10 @@ measurements reduced the routed-expert stage from about 334 ms to 232 ms and
 the complete token from about 832 ms to 733 ms. Cold expert reads from SATA can
 still dominate an individual token, so compare kernels only after warming the
 same expert pages.
+
+At long context the CPU graph selects up to 512 compressed KV rows. It keeps a
+512-entry min-heap instead of inserting every candidate into a full sorted
+array, while preserving the earlier-row tie rule and final position order.
+Tie-heavy randomized tests compare the selected set against the reference
+algorithm. At 2048 tokens this improved decode from 3.24 to 3.32 t/s on the
+reference host.

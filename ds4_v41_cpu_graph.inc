@@ -183,6 +183,40 @@ static void ds41c_sort_indices(int *idx, unsigned n) {
     }
 }
 
+typedef struct { float score; int index; } ds41c_topk_item;
+
+static bool ds41c_topk_worse(ds41c_topk_item a, ds41c_topk_item b) {
+    return a.score < b.score || (a.score == b.score && a.index > b.index);
+}
+
+static void ds41c_topk_sift_down(ds41c_topk_item *heap, unsigned n, unsigned p) {
+    for (;;) {
+        unsigned worst = p, l = 2 * p + 1, r = l + 1;
+        if (l < n && ds41c_topk_worse(heap[l], heap[worst])) worst = l;
+        if (r < n && ds41c_topk_worse(heap[r], heap[worst])) worst = r;
+        if (worst == p) return;
+        ds41c_topk_item t = heap[p]; heap[p] = heap[worst]; heap[worst] = t;
+        p = worst;
+    }
+}
+
+static void ds41c_topk_indices_heap(const float *score, unsigned n,
+                                    unsigned k, int *idx) {
+    ds41c_topk_item heap[512];
+    if (k > n) k = n;
+    for (unsigned i = 0; i < k; i++) heap[i] = (ds41c_topk_item){score[i], (int)i};
+    for (unsigned i = k / 2; i-- > 0;) ds41c_topk_sift_down(heap, k, i);
+    for (unsigned i = k; i < n; i++) {
+        const ds41c_topk_item candidate = {score[i], (int)i};
+        if (ds41c_topk_worse(heap[0], candidate)) {
+            heap[0] = candidate;
+            ds41c_topk_sift_down(heap, k, 0);
+        }
+    }
+    for (unsigned i = 0; i < k; i++) idx[i] = heap[i].index;
+    ds41c_sort_indices(idx, k);
+}
+
 static bool ds41c_attention(ds41_cpu_graph *g, const ds4_model *m, const ds4_layer_weights *l, uint32_t il) {
     const uint32_t pos = g->pos, ratio = ds4_layer_compress_ratio(il);
     const unsigned owner = il < 8 ? 0 : il < 14 ? 1 : il < 20 ? 2 : 3;
@@ -248,11 +282,7 @@ static bool ds41c_attention(ds41_cpu_graph *g, const ds4_model *m, const ds4_lay
         } else if (il > 20) {
             for (unsigned r = 0; r < count; r++) if (!g->block_allowed[r / 8]) g->scores[r] = -INFINITY;
         }
-        topk_desc(g->scores, count, top, g->selected);
-        /* The reference graph restores position order after selecting by
-         * score. It is mathematically equivalent, but fixes accumulation
-         * order for reproducible CPU validation. */
-        ds41c_sort_indices(g->selected, top);
+        ds41c_topk_indices_heap(g->scores, count, top, g->selected);
     }
     const unsigned raw = pos + 1 < 128 ? pos + 1 : 128;
     const ds41c_gather_ctx gather_ctx = {

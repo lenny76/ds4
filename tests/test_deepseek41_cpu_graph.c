@@ -2,7 +2,34 @@
  * until layer/logit parity has been measured on the pinned checkpoint. */
 #include "../ds4.c"
 
+static int test_topk_heap(void) {
+    uint32_t state = 1;
+    float score[4096];
+    int ref[512], got[512];
+    for (unsigned trial = 0; trial < 2000; trial++) {
+        state = state * 1664525u + 1013904223u;
+        const unsigned n = 513u + state % (4096u - 512u);
+        for (unsigned i = 0; i < n; i++) {
+            state = state * 1664525u + 1013904223u;
+            score[i] = (float)((int)(state % 257u) - 128);
+        }
+        topk_desc(score, (int)n, 512, ref);
+        ds41c_sort_indices(ref, 512);
+        ds41c_topk_indices_heap(score, n, 512, got);
+        for (unsigned i = 0; i < 512; i++) {
+            if (ref[i] != got[i]) {
+                fprintf(stderr, "topk mismatch trial=%u n=%u slot=%u ref=%d got=%d\n",
+                        trial, n, i, ref[i], got[i]);
+                return 1;
+            }
+        }
+    }
+    puts("V4.1 heap top-k: 2000 tie-heavy cases exact");
+    return 0;
+}
+
 int main(int argc, char **argv) {
+    if (argc == 2 && !strcmp(argv[1], "--self-test-topk")) return test_topk_heap();
     if (argc < 3) {
         fprintf(stderr, "Usage: %s MODEL.gguf TOKEN_ID [TOKEN_ID ...]\n", argv[0]);
         return 2;

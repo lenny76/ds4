@@ -9184,7 +9184,11 @@ static void matvec_f32(float *out, const ds4_model *m, const ds4_tensor *w, cons
         .x = x,
         .in_dim = w->dim[0],
     };
-    ds4_parallel_for(w->dim[1], matvec_f32_worker, &ctx);
+    /* Same work-based admission as matvec_f16: the MoE router is only 384 rows
+     * but each row reads the full embedding. */
+    const uint64_t ops = w->dim[0] * w->dim[1];
+    const uint64_t min_rows = ops >= DS4_PARALLEL_MIN_MACS ? 1 : 512;
+    ds4_parallel_for_min_rows(w->dim[1], matvec_f32_worker, &ctx, min_rows);
 }
 
 /* Dispatch for dense F32/F16/Q8_0 tensors used by auxiliary projections. */

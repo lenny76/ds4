@@ -11749,6 +11749,49 @@ static float sigmoid_stable(float x) {
 
 /* Sink-aware attention over a set of KV rows.  The learned sink logit is part
  * of the softmax denominator but contributes no value vector. */
+typedef struct {
+    float *out_heads;
+    const float *q;
+    const float *kv_rows;
+    const float *sinks;
+    uint32_t n_kv;
+    float kq_scale;
+} attn_rows_one_ctx;
+
+static void attn_rows_one_worker(void *vctx, uint64_t h0, uint64_t h1) {
+    const attn_rows_one_ctx *c = vctx;
+    /* The V4.1 graph caps kv rows at the 128 raw window plus 512 selected. */
+    float score_stack[640];
+    float *score = c->n_kv <= 640 ? score_stack
+                                  : xmalloc((size_t)c->n_kv * sizeof(score[0]));
+
+    for (uint64_t h = h0; h < h1; h++) {
+        const float *qh = c->q + h * DS4_N_HEAD_DIM;
+
+        float max_score = c->sinks[h];
+        for (uint32_t r = 0; r < c->n_kv; r++) {
+            const float *kv = c->kv_rows + (uint64_t)r * DS4_N_HEAD_DIM;
+            score[r] = dot_f32(qh, kv, DS4_N_HEAD_DIM) * c->kq_scale;
+            if (score[r] > max_score) max_score = score[r];
+        }
+
+        float *oh = c->out_heads + h * DS4_N_HEAD_DIM;
+        memset(oh, 0, (size_t)DS4_N_HEAD_DIM * sizeof(oh[0]));
+
+        float denom = expf(c->sinks[h] - max_score);
+        for (uint32_t r = 0; r < c->n_kv; r++) {
+            const float weight = expf(score[r] - max_score);
+            const float *kv = c->kv_rows + (uint64_t)r * DS4_N_HEAD_DIM;
+            denom += weight;
+            axpy_f32(oh, kv, weight, DS4_N_HEAD_DIM);
+        }
+
+        scale_f32(oh, 1.0f / denom, DS4_N_HEAD_DIM);
+    }
+
+    if (score != score_stack) free(score);
+}
+
 static void layer_attention_rows_one(
         float             * out_heads,
         const ds4_model   * model,
@@ -11756,37 +11799,22 @@ static void layer_attention_rows_one(
         const float       * q,
         const float       * kv_rows,
         uint32_t            n_kv) {
-    const float *sinks = tensor_data(model, layer->attn_sinks);
-    const float kq_scale = 1.0f / sqrtf((float)DS4_N_HEAD_DIM);
-    float score_stack[512];
-    float *score = n_kv <= 512 ? score_stack : xmalloc((size_t)n_kv * sizeof(score[0]));
-
-    for (uint32_t h = 0; h < DS4_N_HEAD; h++) {
-        const float *qh = q + (uint64_t)h * DS4_N_HEAD_DIM;
-
-        float max_score = sinks[h];
-        for (uint32_t r = 0; r < n_kv; r++) {
-            const float *kv = kv_rows + (uint64_t)r * DS4_N_HEAD_DIM;
-            score[r] = dot_f32(qh, kv, DS4_N_HEAD_DIM) * kq_scale;
-            if (score[r] > max_score) max_score = score[r];
-        }
-
-        float *oh = out_heads + (uint64_t)h * DS4_N_HEAD_DIM;
-        memset(oh, 0, (size_t)DS4_N_HEAD_DIM * sizeof(oh[0]));
-
-        float denom = expf(sinks[h] - max_score);
-        for (uint32_t r = 0; r < n_kv; r++) {
-            const float weight = expf(score[r] - max_score);
-            const float *kv = kv_rows + (uint64_t)r * DS4_N_HEAD_DIM;
-            denom += weight;
-            axpy_f32(oh, kv, weight, DS4_N_HEAD_DIM);
-        }
-
-        const float inv = 1.0f / denom;
-        scale_f32(oh, inv, DS4_N_HEAD_DIM);
-    }
-
-    if (score != score_stack) free(score);
+    attn_rows_one_ctx ctx = {
+        .out_heads = out_heads,
+        .q = q,
+        .kv_rows = kv_rows,
+        .sinks = tensor_data(model, layer->attn_sinks),
+        .n_kv = n_kv,
+        .kq_scale = 1.0f / sqrtf((float)DS4_N_HEAD_DIM),
+    };
+    /* Heads are independent and each owns its slice of out_heads, so splitting
+     * them changes no arithmetic. Admit on work: the V4.1 graph reaches here
+     * with hundreds of selected rows, while the sliding-window callers pass
+     * one and must stay serial. */
+    const uint64_t per_head = (uint64_t)n_kv * DS4_N_HEAD_DIM * 2;
+    uint64_t min_heads = per_head ? DS4_PARALLEL_MIN_MACS / per_head : DS4_N_HEAD;
+    if (min_heads == 0) min_heads = 1;
+    ds4_parallel_for_min_rows(DS4_N_HEAD, attn_rows_one_worker, &ctx, min_heads);
 }
 
 static void layer_attention_one(

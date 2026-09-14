@@ -11758,35 +11758,58 @@ typedef struct {
     float kq_scale;
 } attn_rows_one_ctx;
 
+/* Heads processed per streamed pass over the kv rows. A head-at-a-time loop
+ * rereads the whole row buffer twice per head, which stops fitting in L2 once
+ * the indexer starts selecting hundreds of rows. */
+#define DS4_ATTN_HEAD_BLOCK 8
+
 static void attn_rows_one_worker(void *vctx, uint64_t h0, uint64_t h1) {
     const attn_rows_one_ctx *c = vctx;
+    const uint32_t n_kv = c->n_kv;
     /* The V4.1 graph caps kv rows at the 128 raw window plus 512 selected. */
-    float score_stack[640];
-    float *score = c->n_kv <= 640 ? score_stack
-                                  : xmalloc((size_t)c->n_kv * sizeof(score[0]));
+    float score_stack[DS4_ATTN_HEAD_BLOCK * 640];
+    float *score = n_kv <= 640
+        ? score_stack
+        : xmalloc((size_t)DS4_ATTN_HEAD_BLOCK * n_kv * sizeof(score[0]));
 
-    for (uint64_t h = h0; h < h1; h++) {
-        const float *qh = c->q + h * DS4_N_HEAD_DIM;
+    for (uint64_t hb = h0; hb < h1; hb += DS4_ATTN_HEAD_BLOCK) {
+        const uint64_t he = hb + DS4_ATTN_HEAD_BLOCK < h1 ? hb + DS4_ATTN_HEAD_BLOCK : h1;
+        const uint64_t nh = he - hb;
+        float max_score[DS4_ATTN_HEAD_BLOCK], denom[DS4_ATTN_HEAD_BLOCK];
 
-        float max_score = c->sinks[h];
-        for (uint32_t r = 0; r < c->n_kv; r++) {
+        for (uint32_t r = 0; r < n_kv; r++) {
             const float *kv = c->kv_rows + (uint64_t)r * DS4_N_HEAD_DIM;
-            score[r] = dot_f32(qh, kv, DS4_N_HEAD_DIM) * c->kq_scale;
-            if (score[r] > max_score) max_score = score[r];
+            for (uint64_t j = 0; j < nh; j++) {
+                const float *qh = c->q + (hb + j) * DS4_N_HEAD_DIM;
+                score[j * n_kv + r] = dot_f32(qh, kv, DS4_N_HEAD_DIM) * c->kq_scale;
+            }
         }
 
-        float *oh = c->out_heads + h * DS4_N_HEAD_DIM;
-        memset(oh, 0, (size_t)DS4_N_HEAD_DIM * sizeof(oh[0]));
-
-        float denom = expf(c->sinks[h] - max_score);
-        for (uint32_t r = 0; r < c->n_kv; r++) {
-            const float weight = expf(score[r] - max_score);
-            const float *kv = c->kv_rows + (uint64_t)r * DS4_N_HEAD_DIM;
-            denom += weight;
-            axpy_f32(oh, kv, weight, DS4_N_HEAD_DIM);
+        for (uint64_t j = 0; j < nh; j++) {
+            const float *sj = score + j * n_kv;
+            float m = c->sinks[hb + j];
+            for (uint32_t r = 0; r < n_kv; r++) if (sj[r] > m) m = sj[r];
+            max_score[j] = m;
+            denom[j] = expf(c->sinks[hb + j] - m);
+            memset(c->out_heads + (hb + j) * DS4_N_HEAD_DIM, 0,
+                   (size_t)DS4_N_HEAD_DIM * sizeof(float));
         }
 
-        scale_f32(oh, 1.0f / denom, DS4_N_HEAD_DIM);
+        /* Each head still walks r in ascending order, so its weight sum and
+         * its accumulator see exactly the sequence they saw before. */
+        for (uint32_t r = 0; r < n_kv; r++) {
+            const float *kv = c->kv_rows + (uint64_t)r * DS4_N_HEAD_DIM;
+            for (uint64_t j = 0; j < nh; j++) {
+                const float weight = expf(score[j * n_kv + r] - max_score[j]);
+                denom[j] += weight;
+                axpy_f32(c->out_heads + (hb + j) * DS4_N_HEAD_DIM,
+                         kv, weight, DS4_N_HEAD_DIM);
+            }
+        }
+
+        for (uint64_t j = 0; j < nh; j++)
+            scale_f32(c->out_heads + (hb + j) * DS4_N_HEAD_DIM,
+                      1.0f / denom[j], DS4_N_HEAD_DIM);
     }
 
     if (score != score_stack) free(score);

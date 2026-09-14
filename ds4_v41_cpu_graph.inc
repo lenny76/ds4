@@ -218,7 +218,7 @@ static void ds41c_topk_indices_heap(const float *score, unsigned n,
 }
 
 static bool ds41c_attention(ds41_cpu_graph *g, const ds4_model *m, const ds4_layer_weights *l,
-                              uint32_t il, bool projected) {
+                              uint32_t il, bool projected, bool project_output) {
     const uint32_t pos = g->pos, ratio = ds4_layer_compress_ratio(il);
     const unsigned owner = il < 8 ? 0 : il < 14 ? 1 : il < 20 ? 2 : 3;
     const uint32_t count = ratio ? (pos + 1) / ratio : 0;
@@ -299,6 +299,7 @@ static bool ds41c_attention(ds41_cpu_graph *g, const ds4_model *m, const ds4_lay
     layer_attention_rows_one(g->heads, m, l, g->q, g->rows, raw + top);
     ds41c_round(g->heads, 64 * 512);
     if (!ds41c_rope(g->heads, 64, 512, pos, il, true)) return false;
+    if (!project_output) return true;
     /* Each output group has its own 4096 -> 1024 matrix. They are contiguous,
      * so one grouped dispatch replaces eight pool round trips. */
     matvec_q8_0_f32_ref_grouped(g->low, m, l->attn_output_a, g->heads, 8, 4096, 1024);
@@ -347,6 +348,7 @@ static bool ds41c_prefill_chunk(ds41_cpu_graph *g, const ds4_model *m,
     BALLOC(norm, (uint64_t)count * e) BALLOC(block, (uint64_t)count * e)
     BALLOC(shared, (uint64_t)count * e) BALLOC(qr, (uint64_t)count * DS4_N_LORA_Q)
     BALLOC(q, (uint64_t)count * 64u * 512u) BALLOC(kv, (uint64_t)count * 512u)
+    BALLOC(heads, (uint64_t)count * 64u * 512u) BALLOC(low, (uint64_t)count * 8u * 1024u)
     BALLOC(gate, (uint64_t)count * DS4_N_FF_EXP) BALLOC(up, (uint64_t)count * DS4_N_FF_EXP)
     BALLOC(mid, (uint64_t)count * DS4_N_FF_EXP) BALLOC(pre, (uint64_t)count * 4u)
     BALLOC(attn_split, (uint64_t)count * 24u) BALLOC(ffn_split, (uint64_t)count * 24u)
@@ -354,7 +356,7 @@ static bool ds41c_prefill_chunk(ds41_cpu_graph *g, const ds4_model *m,
 #undef BALLOC
     int *selected = calloc((size_t)count * 512u, sizeof(int));
     bool *allowed = calloc((size_t)count * ((g->ctx + 7u) / 8u), sizeof(bool));
-    bool ok = residual && after && norm && block && shared && qr && q && kv && gate && up &&
+    bool ok = residual && after && norm && block && shared && qr && q && kv && heads && low && gate && up &&
               mid && pre && attn_split && ffn_split && disk && selected && allowed;
     const uint32_t initial = g->pos, allowed_stride = (g->ctx + 7u) / 8u;
     ds4_engram_history history = g->history;
@@ -388,6 +390,10 @@ static bool ds41c_prefill_chunk(ds41_cpu_graph *g, const ds4_model *m,
                     DS4_N_EMBD, DS4_RMS_EPS);
                 memcpy(residual + (uint64_t)t * hc, g->residual, hc * sizeof(float));
             }
+        }
+        for (uint32_t t = 0; ok && t < count; t++) {
+            memcpy(g->residual, residual + (uint64_t)t * hc, hc * sizeof(float));
+            memcpy(g->pre, pre + (uint64_t)t * 4u, 4u * sizeof(float));
             ds41c_hc(g, m, l, false);
             hc_weighted_sum_one(g->x, g->residual, g->pre, DS4_N_EMBD, 4);
             ds41c_round(g->x, DS4_N_EMBD);
@@ -412,13 +418,19 @@ static bool ds41c_prefill_chunk(ds41_cpu_graph *g, const ds4_model *m,
             memcpy(g->selected, selected + (uint64_t)t * 512u, 512u * sizeof(int));
             memcpy(g->block_allowed, allowed + (uint64_t)t * allowed_stride,
                    allowed_stride * sizeof(bool));
-            ok = ds41c_attention(g, m, l, il, true);
+            ok = ds41c_attention(g, m, l, il, true, false);
             if (ok) {
-                memcpy(block + (uint64_t)t * e, g->block, e * sizeof(float));
+                memcpy(heads + (uint64_t)t * 64u * 512u, g->heads, 64u * 512u * sizeof(float));
                 memcpy(selected + (uint64_t)t * 512u, g->selected, 512u * sizeof(int));
                 memcpy(allowed + (uint64_t)t * allowed_stride, g->block_allowed,
                        allowed_stride * sizeof(bool));
             }
+        }
+        if (ok) {
+            matmul_q8_0_f32_ref_grouped(low, m, l->attn_output_a, heads,
+                                         count, 8, 4096, 1024);
+            ds41c_round(low, (size_t)count * 8u * 1024u);
+            ds41c_mat_batch(block, m, l->attn_output_b, low, count, true);
         }
         for (uint32_t t = 0; ok && t < count; t++) {
             memcpy(g->residual, residual + (uint64_t)t * hc, hc * sizeof(float));
@@ -428,6 +440,10 @@ static bool ds41c_prefill_chunk(ds41_cpu_graph *g, const ds4_model *m,
                         g->attn_split + 8, DS4_N_EMBD, 4);
             ds41c_round(g->after, hc);
             memcpy(after + (uint64_t)t * hc, g->after, hc * sizeof(float));
+        }
+        for (uint32_t t = 0; ok && t < count; t++) {
+            memcpy(g->after, after + (uint64_t)t * hc, hc * sizeof(float));
+            memcpy(g->attn_split, attn_split + (uint64_t)t * 24u, 24u * sizeof(float));
             ds41c_hc(g, m, l, true);
             hc_weighted_sum_one(g->x, g->after, g->attn_split, DS4_N_EMBD, 4);
             ds41c_round(g->x, DS4_N_EMBD);
@@ -469,7 +485,7 @@ static bool ds41c_prefill_chunk(ds41_cpu_graph *g, const ds4_model *m,
     if (ok) { g->history = history; g->pos = initial + count; g->valid = true; }
     else { g->pos = initial; g->valid = false; }
     free(allowed); free(selected); free(disk); free(ffn_split); free(attn_split); free(pre);
-    free(mid); free(up); free(gate); free(kv); free(q); free(qr); free(shared); free(block);
+    free(mid); free(up); free(gate); free(low); free(heads); free(kv); free(q); free(qr); free(shared); free(block);
     free(norm); free(after); free(residual);
     return ok;
 }
@@ -504,7 +520,7 @@ static bool ds41c_step(ds41_cpu_graph *g, const ds4_model *m, const ds4_weights 
         ds41c_round(g->x, DS4_N_EMBD); ds41c_norm(g->norm, g->x, m, l->attn_norm);
         if (profile) attn_hc_sec += now_sec() - started;
         started = profile ? now_sec() : 0.0;
-        if (!ds41c_attention(g, m, l, il, false)) return false;
+        if (!ds41c_attention(g, m, l, il, false, true)) return false;
         if (profile) attn_sec += now_sec() - started;
         started = profile ? now_sec() : 0.0;
         hc_post_one(g->after, g->block, g->residual, g->attn_split + 4, g->attn_split + 8, DS4_N_EMBD, 4);

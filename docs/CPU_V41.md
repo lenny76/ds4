@@ -94,8 +94,18 @@ batch while preserving F32 activations, BF16 boundaries, causal cache
 publication, and per-token KV selections. A full-model test compares both the
 final prompt logits and a continuation step against the scalar-token graph.
 
+The two attention output projections use the same row-major batch traversal.
+The attention core first records every token's 64 heads, then scans each
+Q8_0 output row across the whole chunk before applying the second projection.
+This preserves the scalar dot-product order and is bit-exact in the full-model
+prompt and continuation comparison.
+
 On the reference dual-socket Xeon host, 512-token prefill improved from 3.69 to
 6.13 t/s (+66%), and batch-8 reached 5.20 t/s at 2048 tokens versus about 3.50
 t/s for scalar-token prefill. Set `DS4_CPU_V41_DISABLE_BATCH_PREFILL=1` for an
 A/B rollback, or `DS4_CPU_V41_BATCH_PREFILL=N` to test a size from 2 through 16.
 The rollback variable takes precedence. Decode still uses `ds41c_step`.
+
+On top of the Engram batch reader, batching the attention output projections
+raised warm 512-token prefill from 6.18 to 6.67 t/s (+7.9%) on the reference
+host. A 2048-token run reached 6.06 t/s prefill and 3.59 t/s decode.

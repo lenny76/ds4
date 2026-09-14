@@ -9083,6 +9083,54 @@ static void matvec_q8_0_f32_ref_grouped_worker(void *vctx, uint64_t r0, uint64_t
 /* Block-diagonal Q8_0 matvec: `groups` independent in_dim -> rows_per_group
  * matrices stored back to back, each reading its own slice of x. Fusing them
  * into one dispatch replaces one pool round trip per group with one total. */
+typedef struct {
+    float *out;
+    const uint8_t *data;
+    const float *x;
+    uint64_t n_tok, groups, in_dim, rows_per_group, blocks, group_bytes;
+} matmul_q8_0_f32_ref_grouped_ctx;
+
+static void matmul_q8_0_f32_ref_grouped_worker(void *vctx, uint64_t r0, uint64_t r1) {
+    matmul_q8_0_f32_ref_grouped_ctx *ctx = vctx;
+    const uint64_t row_bytes = ctx->blocks * 34;
+    const uint64_t out_stride = ctx->groups * ctx->rows_per_group;
+    const uint64_t in_stride = ctx->groups * ctx->in_dim;
+    for (uint64_t r = r0; r < r1; r++) {
+        const uint64_t group = r / ctx->rows_per_group;
+        const uint64_t row = r - group * ctx->rows_per_group;
+        const uint8_t *weights = ctx->data + group * ctx->group_bytes + row * row_bytes;
+        for (uint64_t t = 0; t < ctx->n_tok; t++)
+            ctx->out[t * out_stride + r] = dot_q8_0_row_f32_ref(
+                weights, ctx->x + t * in_stride + group * ctx->in_dim,
+                ctx->in_dim, ctx->blocks);
+    }
+}
+
+static void matmul_q8_0_f32_ref_grouped(
+        float            *out,
+        const ds4_model  *m,
+        const ds4_tensor *w,
+        const float      *x,
+        uint64_t          n_tok,
+        uint64_t          groups,
+        uint64_t          in_dim,
+        uint64_t          rows_per_group) {
+    if (w->type != DS4_TENSOR_Q8_0 || !n_tok || !groups || !in_dim)
+        ds4_die("expected grouped Q8_0 rows and a nonempty batch");
+    uint64_t row_bytes;
+    if (!tensor_nbytes(w->type, in_dim, &row_bytes)) ds4_die("Q8_0 group row size overflow");
+    const uint64_t total = groups * rows_per_group;
+    if (w->bytes < total * row_bytes) ds4_die("Q8_0 grouped batch view is outside tensor");
+    matmul_q8_0_f32_ref_grouped_ctx ctx = {
+        .out = out, .data = tensor_data(m, w), .x = x, .n_tok = n_tok,
+        .groups = groups, .in_dim = in_dim, .rows_per_group = rows_per_group,
+        .blocks = (in_dim + 31) / 32, .group_bytes = rows_per_group * row_bytes,
+    };
+    uint64_t min_rows = DS4_PARALLEL_MIN_MACS / (in_dim * n_tok);
+    if (!min_rows) min_rows = 1;
+    ds4_parallel_for_min_rows(total, matmul_q8_0_f32_ref_grouped_worker, &ctx, min_rows);
+}
+
 static void matvec_q8_0_f32_ref_grouped(
         float            *out,
         const ds4_model  *m,

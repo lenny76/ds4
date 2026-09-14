@@ -52,3 +52,30 @@ weight pages. The CPU graph remains experimental, and parity with the Metal
 backend is still pending. Tests within the CPU implementation verify exact
 prompt and continuation logits for changes from `a3762a0` onward; `70d95e8`
 and `6d65474` change floating-point accumulation order.
+
+## Attention profile at long context
+
+The following decode-stage averages were measured at `e44b325` with 40 workers.
+The 4096-token first sample was excluded because its diagnostic counters also
+contained the preceding prefill.
+
+| Attention substage | 2048 tokens | 4096 tokens | Change |
+|---|---:|---:|---:|
+| Input Q8_0 projections | 57.54 ms | 55.90 ms | -1.64 ms |
+| RoPE and KV publication | 4.94 ms | 5.02 ms | +0.08 ms |
+| Compressor | 0.82 ms | 0.87 ms | +0.05 ms |
+| Index projection | 3.05 ms | 3.18 ms | +0.13 ms |
+| Index scoring | 4.37 ms | 5.82 ms | +1.45 ms |
+| Index selection | 1.53 ms | 2.08 ms | +0.55 ms |
+| Selected-row gather | 2.86 ms | 2.82 ms | -0.04 ms |
+| Attention rows | 24.18 ms | 25.18 ms | +1.00 ms |
+| Post-processing | 1.52 ms | 1.43 ms | -0.09 ms |
+| Output Q8_0 projections | 60.01 ms | 59.65 ms | -0.36 ms |
+| **Complete attention** | **160.83 ms** | **161.96 ms** | **+1.13 ms** |
+| **Complete token** | **328.30 ms** | **332.21 ms** | **+3.91 ms** |
+
+The 512-row selection cap keeps attention nearly flat beyond 2048 tokens.
+Index scoring and selection grow with context, but together add only 2.00 ms
+between these frontiers. Input and output Q8_0 projections consume about
+117 ms, or 72% of attention and 35% of the complete token, so projection reuse
+is a higher-value target than further selected-row copy removal.

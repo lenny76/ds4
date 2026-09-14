@@ -69902,7 +69902,10 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
             if (ds4_session_cancelled(s)) {
                 snprintf(err, errlen, "interrupted"); return DS4_SESSION_SYNC_INTERRUPTED;
             }
-            if (!ds41c_step(g, &s->engine->model, &s->engine->weights, prompt->v[i], s->logits)) {
+            /* Only the final prompt token's logits are ever read, and the
+             * output head is a full vocabulary projection. */
+            float *step_logits = (i + 1 == prompt->len) ? s->logits : NULL;
+            if (!ds41c_step(g, &s->engine->model, &s->engine->weights, prompt->v[i], step_logits)) {
                 s->checkpoint_valid = false;
                 snprintf(err, errlen, "V4.1 CPU prefill failed at token %d", i); return 1;
             }

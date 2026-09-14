@@ -358,20 +358,20 @@ static bool ds41c_prefill_chunk(ds41_cpu_graph *g, const ds4_model *m,
               mid && pre && attn_split && ffn_split && disk && selected && allowed;
     const uint32_t initial = g->pos, allowed_stride = (g->ctx + 7u) / 8u;
     ds4_engram_history history = g->history;
+    uint32_t ids[16][2][24];
     g->valid = false;
     for (uint32_t t = 0; ok && t < count; t++) {
-        uint32_t ids[2][24];
         ok = token[t] >= 0 && (uint32_t)token[t] < DS4_N_VOCAB &&
-             ds4_engram_hash(&g->engram, &history, token + t, NULL, 1, &ids[0][0]);
-        for (unsigned table = 0; ok && table < 2; table++)
-            ok = ds4_engram_read(&g->tables[table], ids[table], 24,
-                disk + ((uint64_t)t * 2u + table) * 24u * 256u);
+             ds4_engram_hash(&g->engram, &history, token + t, NULL, 1, &ids[t][0][0]);
         if (ok) {
             embed_token_any(m, w, token[t], g->x);
             hc_from_plain_embedding(residual + (uint64_t)t * hc, g->x, DS4_N_EMBD, 4);
             pre[(uint64_t)t * 4u] = 1.0f;
         }
     }
+    for (unsigned table = 0; ok && table < 2; table++)
+        ok = ds4_engram_read_batch(&g->tables[table], &ids[0][table][0], count, 48u,
+            disk + (uint64_t)table * count * 24u * 256u);
     for (unsigned il = 0; ok && il < 40; il++) {
         const ds4_layer_weights *l = &w->layer[il];
         for (uint32_t t = 0; ok && t < count; t++) {
@@ -379,7 +379,8 @@ static bool ds41c_prefill_chunk(ds41_cpu_graph *g, const ds4_model *m,
             memcpy(g->pre, pre + (uint64_t)t * 4u, 4u * sizeof(float));
             if (ds41_engram_layer(il)) {
                 const unsigned table = il == 1 ? 0 : 1;
-                memcpy(g->disk_rows[table], disk + ((uint64_t)t * 2u + table) * 24u * 256u,
+                memcpy(g->disk_rows[table],
+                       disk + ((uint64_t)table * count + t) * 24u * 256u,
                        sizeof(g->disk_rows[table]));
                 ds41c_mat(g->engram_kv, m, l->engram_kv, g->disk_rows[table], true);
                 ds41_cpu_engram_add(g->residual, g->engram_kv,

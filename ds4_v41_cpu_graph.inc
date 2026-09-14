@@ -154,6 +154,26 @@ static void ds41c_index_score_worker(void *vctx, uint64_t r0, uint64_t r1) {
     }
 }
 
+typedef struct {
+    float *rows;
+    const float *window, *compressed;
+    const int *selected;
+    unsigned raw;
+    uint32_t pos;
+} ds41c_gather_ctx;
+
+/* Row r < raw comes from the sliding window, the rest from the compressed
+ * cache in the order the indexer selected; each row owns its output slot. */
+static void ds41c_gather_worker(void *vctx, uint64_t r0, uint64_t r1) {
+    const ds41c_gather_ctx *c = vctx;
+    for (uint64_t r = r0; r < r1; r++) {
+        const float *src = r < c->raw
+            ? c->window + (((uint64_t)c->pos + 1 - c->raw + r) % 128) * 512
+            : c->compressed + (size_t)c->selected[r - c->raw] * 512;
+        memcpy(c->rows + r * 512, src, 512 * sizeof(float));
+    }
+}
+
 static void ds41c_sort_indices(int *idx, unsigned n) {
     for (unsigned i = 1; i < n; i++) {
         const int value = idx[i];
@@ -235,10 +255,14 @@ static bool ds41c_attention(ds41_cpu_graph *g, const ds4_model *m, const ds4_lay
         ds41c_sort_indices(g->selected, top);
     }
     const unsigned raw = pos + 1 < 128 ? pos + 1 : 128;
-    for (unsigned r = 0; r < raw; r++)
-        memcpy(g->rows + r * 512, g->window[il] + ((pos + 1 - raw + r) % 128) * 512, 512 * sizeof(float));
-    for (unsigned r = 0; r < top; r++)
-        memcpy(g->rows + (raw + r) * 512, g->compressed[owner] + (size_t)g->selected[r] * 512, 512 * sizeof(float));
+    const ds41c_gather_ctx gather_ctx = {
+        .rows = g->rows, .window = g->window[il], .compressed = g->compressed[owner],
+        .selected = g->selected, .raw = raw, .pos = pos,
+    };
+    /* Selected rows are scattered through the compressed cache, so each copy
+     * is dominated by a cache miss of about a microsecond; below this many
+     * rows a pool round trip costs more than it saves. */
+    ds4_parallel_for_min_rows(raw + top, ds41c_gather_worker, (void *)&gather_ctx, 64);
     layer_attention_rows_one(g->heads, m, l, g->q, g->rows, raw + top);
     ds41c_round(g->heads, 64 * 512);
     if (!ds41c_rope(g->heads, 64, 512, pos, il, true)) return false;

@@ -1948,14 +1948,19 @@ typedef void (*ds4_parallel_fn)(void *ctx, uint64_t row0, uint64_t row1);
 typedef struct {
     pthread_t threads[DS4_MAX_THREADS];
     pthread_mutex_t mutex;
+    pthread_mutex_t dispatch;
     pthread_cond_t work_cond;
     pthread_cond_t done_cond;
     uint32_t n_threads;
     uint32_t n_workers;
-    uint32_t generation;
-    uint32_t done;
+    /* Workers poll these between jobs without taking the mutex; volatile keeps
+     * the loads inside the spin loop. Only the dispatcher writes generation,
+     * and done is bumped with an atomic builtin. */
+    volatile uint32_t generation;
+    volatile uint32_t done;
+    volatile bool shutdown;
+    uint32_t sleepers;
     bool initialized;
-    bool shutdown;
     ds4_parallel_fn fn;
     void *ctx;
     uint64_t n_rows;
@@ -1965,26 +1970,48 @@ static ds4_thread_pool g_pool;
 static __thread int g_parallel_depth;
 static uint32_t g_requested_threads;
 
+/* Decode dispatches roughly every half millisecond, while waking the pool
+ * through a condition variable costs tens of microseconds per dispatch and
+ * grows with worker count. Spinning about this long keeps workers hot for a
+ * whole token and still parks them between requests. */
+#define DS4_POOL_SPIN_ITERS 32768u
+
+static inline void ds4_cpu_relax(void) {
+#if defined(__x86_64__) || defined(__i386__)
+    _mm_pause();
+#endif
+}
+
 static void *ds4_worker_main(void *arg) {
     const uint32_t tid = (uint32_t)(uintptr_t)arg;
     uint32_t seen_generation = 0;
 
     for (;;) {
-        pthread_mutex_lock(&g_pool.mutex);
-        while (seen_generation == g_pool.generation && !g_pool.shutdown) {
-            pthread_cond_wait(&g_pool.work_cond, &g_pool.mutex);
+        uint32_t gen = g_pool.generation;
+        for (uint32_t spins = 0;
+             gen == seen_generation && !g_pool.shutdown && spins < DS4_POOL_SPIN_ITERS;
+             spins++) {
+            ds4_cpu_relax();
+            gen = g_pool.generation;
         }
-        if (g_pool.shutdown) {
+        if (gen == seen_generation && !g_pool.shutdown) {
+            pthread_mutex_lock(&g_pool.mutex);
+            g_pool.sleepers++;
+            while ((gen = g_pool.generation) == seen_generation && !g_pool.shutdown) {
+                pthread_cond_wait(&g_pool.work_cond, &g_pool.mutex);
+            }
+            g_pool.sleepers--;
             pthread_mutex_unlock(&g_pool.mutex);
-            return NULL;
         }
+        if (g_pool.shutdown) return NULL;
 
-        seen_generation = g_pool.generation;
-        ds4_parallel_fn fn = g_pool.fn;
-        void *ctx = g_pool.ctx;
+        /* The dispatcher publishes fn, ctx and n_rows before bumping the
+         * generation and waits for every worker before publishing again. */
+        seen_generation = gen;
+        const ds4_parallel_fn fn = g_pool.fn;
+        void *const ctx = g_pool.ctx;
         const uint64_t n_rows = g_pool.n_rows;
         const uint32_t n_threads = g_pool.n_threads;
-        pthread_mutex_unlock(&g_pool.mutex);
 
         const uint64_t rows_per_thread = (n_rows + n_threads - 1) / n_threads;
         const uint64_t row0 = (uint64_t)tid * rows_per_thread;
@@ -1996,12 +2023,11 @@ static void *ds4_worker_main(void *arg) {
             g_parallel_depth--;
         }
 
-        pthread_mutex_lock(&g_pool.mutex);
-        g_pool.done++;
-        if (g_pool.done == g_pool.n_workers) {
+        if (__sync_add_and_fetch(&g_pool.done, 1u) == g_pool.n_workers) {
+            pthread_mutex_lock(&g_pool.mutex);
             pthread_cond_signal(&g_pool.done_cond);
+            pthread_mutex_unlock(&g_pool.mutex);
         }
-        pthread_mutex_unlock(&g_pool.mutex);
     }
 }
 
@@ -2028,12 +2054,14 @@ static void ds4_threads_init(void) {
     if (n_threads == 0) n_threads = 1;
 
     pthread_mutex_init(&g_pool.mutex, NULL);
+    pthread_mutex_init(&g_pool.dispatch, NULL);
     pthread_cond_init(&g_pool.work_cond, NULL);
     pthread_cond_init(&g_pool.done_cond, NULL);
     g_pool.n_threads = n_threads;
     g_pool.n_workers = n_threads > 0 ? n_threads - 1 : 0;
     g_pool.generation = 0;
     g_pool.done = 0;
+    g_pool.sleepers = 0;
     g_pool.shutdown = false;
     g_pool.initialized = true;
     if (getenv("DS4_CPU_V41_EXPERIMENTAL"))
@@ -2061,6 +2089,7 @@ static void ds4_threads_shutdown(void) {
 
     pthread_cond_destroy(&g_pool.done_cond);
     pthread_cond_destroy(&g_pool.work_cond);
+    pthread_mutex_destroy(&g_pool.dispatch);
     pthread_mutex_destroy(&g_pool.mutex);
     memset(&g_pool, 0, sizeof(g_pool));
 }
@@ -2080,18 +2109,21 @@ static void ds4_parallel_for_min_rows(uint64_t n_rows, ds4_parallel_fn fn, void 
         return;
     }
 
-    pthread_mutex_lock(&g_pool.mutex);
+    pthread_mutex_lock(&g_pool.dispatch);
     g_pool.fn = fn;
     g_pool.ctx = ctx;
     g_pool.n_rows = n_rows;
     g_pool.done = 0;
     g_pool.generation++;
-    pthread_cond_broadcast(&g_pool.work_cond);
+    /* A worker increments sleepers and rechecks the generation under the
+     * mutex before parking, so checking here cannot miss one. */
+    pthread_mutex_lock(&g_pool.mutex);
+    if (g_pool.sleepers) pthread_cond_broadcast(&g_pool.work_cond);
+    pthread_mutex_unlock(&g_pool.mutex);
 
     const uint64_t rows_per_thread = (n_rows + g_pool.n_threads - 1) / g_pool.n_threads;
     uint64_t main_row1 = rows_per_thread;
     if (main_row1 > n_rows) main_row1 = n_rows;
-    pthread_mutex_unlock(&g_pool.mutex);
 
     if (main_row1 > 0) {
         g_parallel_depth++;
@@ -2099,11 +2131,19 @@ static void ds4_parallel_for_min_rows(uint64_t n_rows, ds4_parallel_fn fn, void 
         g_parallel_depth--;
     }
 
-    pthread_mutex_lock(&g_pool.mutex);
-    while (g_pool.done < g_pool.n_workers) {
-        pthread_cond_wait(&g_pool.done_cond, &g_pool.mutex);
+    for (uint32_t spins = 0;
+         g_pool.done < g_pool.n_workers && spins < DS4_POOL_SPIN_ITERS;
+         spins++) {
+        ds4_cpu_relax();
     }
-    pthread_mutex_unlock(&g_pool.mutex);
+    if (g_pool.done < g_pool.n_workers) {
+        pthread_mutex_lock(&g_pool.mutex);
+        while (g_pool.done < g_pool.n_workers) {
+            pthread_cond_wait(&g_pool.done_cond, &g_pool.mutex);
+        }
+        pthread_mutex_unlock(&g_pool.mutex);
+    }
+    pthread_mutex_unlock(&g_pool.dispatch);
 }
 
 static void ds4_parallel_for(uint64_t n_rows, ds4_parallel_fn fn, void *ctx) {

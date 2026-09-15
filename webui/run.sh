@@ -21,6 +21,21 @@ if [ ! -f "$MODEL" ]; then
     exit 1
 fi
 
+check_port() {
+    if ! python3 -c 'import socket, sys
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind((sys.argv[1], int(sys.argv[2])))
+s.close()' "$1" "$2" 2>/dev/null; then
+        echo "run.sh: $3 port $1:$2 is already in use" >&2
+        exit 1
+    fi
+}
+
+# Fail before loading the model if either listener cannot be created.
+check_port "$MODEL_HOST" "$MODEL_PORT" "model server"
+check_port "$UI_HOST" "$UI_PORT" "Web UI"
+
 server_pid=
 cleanup() {
     trap - INT TERM EXIT

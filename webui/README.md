@@ -20,6 +20,8 @@ weight warmup to finish, then exposes the UI on port 8080. `Ctrl+C` stops both
 processes. It uses 40 CPU workers and a 4096-token context by default. Override
 these with `DS4_THREADS` and `DS4_CTX`; set `DS4_WARM_WEIGHTS=0` to skip the
 startup warmup. `DS4_UI_API_KEY` protects the LAN-facing API when set.
+The launcher checks both listening ports before loading the model and reports
+an existing process immediately instead of failing after the warmup.
 
 ### Separate processes
 

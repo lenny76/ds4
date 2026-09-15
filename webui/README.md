@@ -6,6 +6,23 @@ localhost; this process is the only LAN-facing service.
 
 ## Start
 
+### One command
+
+Build the CPU server, point `DS4_MODEL` at the GGUF, and run:
+
+```sh
+make cpu
+DS4_MODEL=/path/to/model.gguf webui/run.sh
+```
+
+The launcher starts the model server on localhost, waits for model loading and
+weight warmup to finish, then exposes the UI on port 8080. `Ctrl+C` stops both
+processes. It uses 40 CPU workers and a 4096-token context by default. Override
+these with `DS4_THREADS` and `DS4_CTX`; set `DS4_WARM_WEIGHTS=0` to skip the
+startup warmup. `DS4_UI_API_KEY` protects the LAN-facing API when set.
+
+### Separate processes
+
 Start DwarfStar on the Linux model host:
 
 ```sh

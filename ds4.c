@@ -66248,7 +66248,12 @@ static int ds4_engine_open_internal(ds4_engine **out,
             return 1;
         }
     }
-    if (engine_warm_full_model(opt) && DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_DEEPSEEK41)
+    /* V4.1 CPU has already unmapped its trailing 189 GiB Engram tables, so
+     * warming this mapping covers only the roughly 152 GiB compute weights.
+     * The Apple graph performs its admitted warm pass below. */
+    if (engine_warm_full_model(opt) &&
+        (DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_DEEPSEEK41 ||
+         e->backend == DS4_BACKEND_CPU))
         model_warm_weights(&e->model);
     if (opt->vision_path && opt->vision_path[0]) {
         if (!ds4_model_is_glm53() && !g_ds4_flash_vision_exp &&

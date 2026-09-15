@@ -38,6 +38,7 @@ cache state, CPU frequency, thread count, and prompt length.
 | `e44b325` | Batched attention output projections | 512 | **6.67 t/s** | 3.63 t/s | +7.9% prefill versus `beb4a00` |
 | `e44b325` | Batched attention output projections | 2048 | **6.06 t/s** | **3.59 t/s** | current measured frontier |
 | Q8 rows4 | Four-row AVX-512 F32 x Q8_0 decode kernel | 2048 | 6.12 t/s | **3.64 t/s** | +4.0% versus 3.50 warm A/B baseline |
+| CPU V4.1 weight warmup | Preload the 151.76 GiB compute mapping; Engram remains unmapped | 512 | **6.17 t/s** | **3.35 t/s** | 48 s warmup with a partially populated Linux page cache |
 
 ## Rejected experiments
 

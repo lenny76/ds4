@@ -42,6 +42,12 @@ DS4_CPU_V41_EXPERIMENTAL=1 ./ds4 --cpu -t 48 \
   --prompt "Write a short greeting."
 ```
 
+On hosts whose RAM cannot hold the complete GGUF, `--warm-weights` touches only
+the V4.1 compute-weight mapping at startup. The trailing disk-only Engram tables
+are unmapped first and are not pulled into the page cache by this pass. On the
+Q2 checkpoint this prepares roughly 152 GiB and can take several minutes on a
+SATA SSD, but avoids first-use faults for dense and routed compute weights.
+
 The worker pool accepts up to 64 threads. More threads do not necessarily
 improve throughput: benchmark the same deterministic prompt at several thread
 counts. On the current reference host, increasing the effective pool from 32

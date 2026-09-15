@@ -44,6 +44,7 @@ cache state, CPU frequency, thread count, and prompt length.
 |---|---:|---:|---|
 | Exact routed-MoE batching | 6.67 t/s prefill | 4.56 t/s | Reverted: -31.6% |
 | F16 hyper-connection batching | 6.47/6.65 t/s control | 6.62/6.62 t/s | Reverted: average effect below 1% |
+| Fuse Q8_0 Q-A and KV projections | 3.63 t/s warm control | 3.61/3.63 t/s | Reverted: no decode gain |
 | Interleave memory across NUMA nodes | 0.95 t/s generation | 0.48 t/s | Rejected: about -49% |
 | Relocate Q8 weights onto anonymous huge pages | existing mapping | about -13% | Reverted |
 

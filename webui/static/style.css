@@ -1,0 +1,16 @@
+:root { color-scheme: dark; font: 16px/1.5 system-ui, sans-serif; background:#0d1117; color:#e6edf3 }
+* { box-sizing:border-box } body { margin:0; min-height:100vh }
+header { position:sticky; top:0; display:flex; justify-content:space-between; padding:14px 20px; background:#161b22; border-bottom:1px solid #30363d }
+#status { color:#8b949e; font-size:.9rem } main { max-width:850px; margin:auto; padding:24px 18px 180px }
+.message { padding:14px 16px; margin:12px 0; border-radius:12px; white-space:pre-wrap; overflow-wrap:anywhere }
+.user { margin-left:12%; background:#1f6feb }.assistant { margin-right:12%; background:#161b22; border:1px solid #30363d }
+.reasoning { color:#8b949e; border-left:2px solid #30363d; padding-left:12px; margin-bottom:10px; font-size:.92rem }
+.composer { position:fixed; bottom:0; left:0; right:0; padding:14px max(18px,calc((100% - 850px)/2)); background:linear-gradient(transparent,#0d1117 18%); padding-top:35px }
+textarea,input { width:100%; color:inherit; background:#161b22; border:1px solid #30363d; border-radius:8px; padding:10px; font:inherit }
+textarea:focus,input:focus { outline:2px solid #2f81f7 }.actions { display:flex; gap:8px; justify-content:flex-end; margin-top:8px }
+button { color:white; background:#238636; border:0; border-radius:7px; padding:9px 15px; font-weight:600; cursor:pointer }
+button.secondary { background:#30363d } button.danger { background:#da3633 } button:disabled { opacity:.5 }
+dialog { width:min(440px,90vw); color:inherit; background:#161b22; border:1px solid #30363d; border-radius:12px }
+dialog::backdrop { background:#0009 } label { display:block; margin:14px 0 } label input[type=checkbox] { width:auto }
+h2 { margin-top:0 } .empty { text-align:center; color:#8b949e; margin-top:25vh }
+@media(max-width:600px) { .user,.assistant { margin-left:0; margin-right:0 } button { padding:9px 11px } }

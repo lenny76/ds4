@@ -131,6 +131,9 @@ root; use `--chdir /path/to/ds4` when launching elsewhere.
 The server listens at `http://127.0.0.1:8000` by default; see [serving](docs/SERVER.md)
 for API access and multiple sessions.
 
+To use the model from browsers and API clients on a trusted local network,
+see the dependency-free [LAN web UI and API proxy](webui/README.md).
+
 The interactive CLI keeps a multi-turn conversation. Use `/help`, `/read FILE`,
 `/ctx N`, and `/quit`. Ctrl+C interrupts generation and returns to the prompt.
 Run each binary with `--help` for its full options.

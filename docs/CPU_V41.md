@@ -11,6 +11,9 @@ The measured optimization history is tracked in
 On x86-64, `make cpu` uses `-march=native`. CPUs exposing AVX-512 VNNI and
 AVX-512 VL therefore use exact integer VNNI kernels for the IQ2_XXS and Q2_K
 expert projections; other x86 CPUs retain the scalar implementation.
+The F32 x Q8_0 decode path also evaluates four output rows together on
+AVX-512F/BW, reusing each activation load while retaining the accumulation
+order of every row. Set `DS4_CPU_V41_DISABLE_Q8_ROWS4=1` for an A/B rollback.
 
 ## Implemented
 

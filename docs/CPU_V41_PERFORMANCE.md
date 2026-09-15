@@ -37,6 +37,7 @@ cache state, CPU frequency, thread count, and prompt length.
 | `beb4a00` | Batched Linux Engram reads | 512 | 6.18 t/s | - | +0.8%, near measurement noise |
 | `e44b325` | Batched attention output projections | 512 | **6.67 t/s** | 3.63 t/s | +7.9% prefill versus `beb4a00` |
 | `e44b325` | Batched attention output projections | 2048 | **6.06 t/s** | **3.59 t/s** | current measured frontier |
+| Q8 rows4 | Four-row AVX-512 F32 x Q8_0 decode kernel | 2048 | 6.12 t/s | **3.64 t/s** | +4.0% versus 3.50 warm A/B baseline |
 
 ## Rejected experiments
 

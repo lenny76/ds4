@@ -8969,17 +8969,64 @@ static inline float dot_q8_0_row_f32_ref(
     return acc;
 }
 
+static inline void dot_q8_0_rows4_f32_ref(
+        float          out[4],
+        const uint8_t *row0,
+        uint64_t       row_bytes,
+        const float   *x,
+        uint64_t       in_dim,
+        uint64_t       blocks) {
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+    __m512 acc0[4] = { _mm512_setzero_ps(), _mm512_setzero_ps(),
+                       _mm512_setzero_ps(), _mm512_setzero_ps() };
+    __m512 acc1[4] = { _mm512_setzero_ps(), _mm512_setzero_ps(),
+                       _mm512_setzero_ps(), _mm512_setzero_ps() };
+    uint64_t b = 0;
+    for (; b < blocks && in_dim - b * 32 >= 32; b++) {
+        const __m512 x0 = _mm512_loadu_ps(x + b * 32);
+        const __m512 x1 = _mm512_loadu_ps(x + b * 32 + 16);
+        for (unsigned j = 0; j < 4; j++) {
+            const uint8_t *block = row0 + j * row_bytes + b * 34;
+            uint16_t scale_bits;
+            memcpy(&scale_bits, block, sizeof(scale_bits));
+            const __m512 dv = _mm512_set1_ps(f16_to_f32(scale_bits));
+            const __m256i q = _mm256_loadu_si256((const __m256i *)(block + 2));
+            const __m512 q0 = _mm512_cvtepi32_ps(
+                _mm512_cvtepi8_epi32(_mm256_castsi256_si128(q)));
+            const __m512 q1 = _mm512_cvtepi32_ps(
+                _mm512_cvtepi8_epi32(_mm256_extracti128_si256(q, 1)));
+            acc0[j] = _mm512_fmadd_ps(_mm512_mul_ps(dv, q0), x0, acc0[j]);
+            acc1[j] = _mm512_fmadd_ps(_mm512_mul_ps(dv, q1), x1, acc1[j]);
+        }
+    }
+    if (b == blocks) {
+        for (unsigned j = 0; j < 4; j++)
+            out[j] = _mm512_reduce_add_ps(_mm512_add_ps(acc0[j], acc1[j]));
+        return;
+    }
+#endif
+    for (unsigned j = 0; j < 4; j++)
+        out[j] = dot_q8_0_row_f32_ref(row0 + j * row_bytes, x, in_dim, blocks);
+}
+
 typedef struct {
     float *out;
     const uint8_t *data;
     const float *x;
     uint64_t in_dim;
     uint64_t blocks;
+    bool rows4;
 } matvec_q8_0_f32_ref_ctx;
 
 static void matvec_q8_0_f32_ref_worker(void *vctx, uint64_t r0, uint64_t r1) {
     matvec_q8_0_f32_ref_ctx *ctx = vctx;
     const uint64_t row_bytes = ctx->blocks * 34;
+    if (ctx->rows4) {
+        for (; r0 + 4 <= r1; r0 += 4)
+            dot_q8_0_rows4_f32_ref(ctx->out + r0,
+                                   ctx->data + r0 * row_bytes, row_bytes,
+                                   ctx->x, ctx->in_dim, ctx->blocks);
+    }
     for (uint64_t r = r0; r < r1; r++) {
         ctx->out[r] = dot_q8_0_row_f32_ref(ctx->data + r * row_bytes,
                                            ctx->x,
@@ -8996,12 +9043,17 @@ static void matvec_q8_0_f32_ref(
     if (w->type != DS4_TENSOR_Q8_0 || w->ndim < 2 || w->dim[0] == 0) {
         ds4_die("expected a Q8_0 tensor with matrix rows");
     }
+    bool rows4 = false;
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+    rows4 = getenv("DS4_CPU_V41_DISABLE_Q8_ROWS4") == NULL;
+#endif
     matvec_q8_0_f32_ref_ctx ctx = {
         .out = out,
         .data = tensor_data(m, w),
         .x = x,
         .in_dim = w->dim[0],
         .blocks = (w->dim[0] + 31) / 32,
+        .rows4 = rows4,
     };
     /* Admit on total work rather than row count. A fixed row threshold leaves
      * the V4.1 hyper-connection mixers serial: they emit 24 rows but each one

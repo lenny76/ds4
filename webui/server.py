@@ -97,7 +97,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Access-Control-Allow-Origin", "*")
             self.send_header("Connection", "close")
             self.end_headers()
-            while chunk := response.read(16 * 1024):
+            while chunk := response.read1(16 * 1024):
                 self.wfile.write(chunk)
                 self.wfile.flush()
         except (OSError, http.client.HTTPException) as exc:

@@ -12,7 +12,7 @@ function showPerformance(bubble, message) {
   if (p.completionTokens !== undefined) parts.push(`Output: ${p.completionTokens} token`);
   if (p.firstTokenSeconds !== undefined) parts.push(`Primo token: ${p.firstTokenSeconds.toFixed(2)} s`);
   if (p.totalSeconds !== undefined) parts.push(`Totale: ${p.totalSeconds.toFixed(2)} s`);
-  if (p.generationTps !== undefined) parts.push(`Generazione stimata: ${p.generationTps.toFixed(2)} t/s`);
+  if (p.totalSeconds>0 && p.completionTokens!==undefined) parts.push(`Output / tempo totale: ${(p.completionTokens/p.totalSeconds).toFixed(2)} t/s`);
   stats.textContent=parts.join(' · ');
 }
 
@@ -73,8 +73,6 @@ async function send() {
     assistant.performance={...assistant.performance,totalSeconds:(ended-started)/1000};
     if (firstToken!==null) {
       assistant.performance.firstTokenSeconds=(firstToken-started)/1000;
-      const tokens=assistant.performance.completionTokens, seconds=(ended-firstToken)/1000;
-      if (tokens>1 && seconds>0) assistant.performance.generationTps=(tokens-1)/seconds;
     }
     showPerformance(bubble,assistant);
     save(); $('status').textContent='online';

@@ -3,6 +3,19 @@ const chat = $('chat');
 let messages = JSON.parse(localStorage.getItem('ds4.messages') || '[]');
 let controller = null;
 
+function showPerformance(bubble, message) {
+  if (!message.performance) return;
+  let stats = bubble.querySelector('.performance');
+  if (!stats) { stats = document.createElement('div'); stats.className='performance'; bubble.appendChild(stats); }
+  const p=message.performance, parts=[];
+  if (p.promptTokens !== undefined) parts.push(`Input: ${p.promptTokens} token`);
+  if (p.completionTokens !== undefined) parts.push(`Output: ${p.completionTokens} token`);
+  if (p.firstTokenSeconds !== undefined) parts.push(`Primo token: ${p.firstTokenSeconds.toFixed(2)} s`);
+  if (p.totalSeconds !== undefined) parts.push(`Totale: ${p.totalSeconds.toFixed(2)} s`);
+  if (p.generationTps !== undefined) parts.push(`Generazione stimata: ${p.generationTps.toFixed(2)} t/s`);
+  stats.textContent=parts.join(' · ');
+}
+
 function render() {
   chat.innerHTML = '';
   if (!messages.length) chat.innerHTML = '<div class="empty">Come posso aiutarti?</div>';
@@ -18,7 +31,7 @@ function addBubble(message) {
     div.appendChild(reasoning);
   }
   const content = document.createElement('div'); content.textContent = message.content || '';
-  div.appendChild(content); chat.appendChild(div); return {div, content};
+  div.appendChild(content); showPerformance(div,message); chat.appendChild(div); return {div, content};
 }
 function save() { localStorage.setItem('ds4.messages', JSON.stringify(messages)); }
 function settings() { return JSON.parse(localStorage.getItem('ds4.settings') || '{}'); }
@@ -30,11 +43,12 @@ async function send() {
   const assistant = {role:'assistant', content:'', reasoning:''}; messages.push(assistant);
   render(); const bubble = chat.lastElementChild; const content = bubble.lastElementChild;
   controller = new AbortController(); $('sendButton').disabled=true; $('stopButton').hidden=false;
+  const started=performance.now(); let firstToken=null;
   try {
     const response = await fetch('/v1/chat/completions', {
       method:'POST', signal:controller.signal,
       headers:{'Content-Type':'application/json', ...(cfg.apiKey ? {'Authorization':`Bearer ${cfg.apiKey}`} : {})},
-      body:JSON.stringify({model:cfg.model || 'deepseek-v4-flash', messages:messages.slice(0,-1).map(({role,content})=>({role,content})), stream:true, temperature:Number(cfg.temperature ?? 1), max_tokens:Number(cfg.maxTokens ?? 4096), think:cfg.thinking ?? true})
+      body:JSON.stringify({model:cfg.model || 'deepseek-v4-flash', messages:messages.slice(0,-1).map(({role,content})=>({role,content})), stream:true, stream_options:{include_usage:true}, temperature:Number(cfg.temperature ?? 1), max_tokens:Number(cfg.maxTokens ?? 4096), think:cfg.thinking ?? true})
     });
     if (!response.ok) throw new Error((await response.text()) || `HTTP ${response.status}`);
     const reader=response.body.getReader(), decoder=new TextDecoder(); let buffer='';
@@ -44,7 +58,9 @@ async function send() {
       for (const line of lines) {
         if (!line.startsWith('data:')) continue;
         const data=line.slice(5).trim(); if (!data || data==='[DONE]') continue;
-        const delta=JSON.parse(data).choices?.[0]?.delta || {};
+        const event=JSON.parse(data), delta=event.choices?.[0]?.delta || {};
+        if (event.usage) assistant.performance={promptTokens:event.usage.prompt_tokens, completionTokens:event.usage.completion_tokens};
+        if (firstToken===null && (delta.content || delta.reasoning_content || delta.reasoning)) firstToken=performance.now();
         assistant.content += delta.content || ''; assistant.reasoning += delta.reasoning_content || delta.reasoning || '';
         content.textContent=assistant.content;
         let reasoning=bubble.querySelector('.reasoning');
@@ -53,6 +69,14 @@ async function send() {
         scrollTo(0,document.body.scrollHeight);
       }
     }
+    const ended=performance.now();
+    assistant.performance={...assistant.performance,totalSeconds:(ended-started)/1000};
+    if (firstToken!==null) {
+      assistant.performance.firstTokenSeconds=(firstToken-started)/1000;
+      const tokens=assistant.performance.completionTokens, seconds=(ended-firstToken)/1000;
+      if (tokens>1 && seconds>0) assistant.performance.generationTps=(tokens-1)/seconds;
+    }
+    showPerformance(bubble,assistant);
     save(); $('status').textContent='online';
   } catch (error) {
     if (error.name !== 'AbortError') { assistant.content=`Errore: ${error.message}`; content.textContent=assistant.content; $('status').textContent='errore'; }

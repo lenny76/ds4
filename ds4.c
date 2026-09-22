@@ -59604,9 +59604,123 @@ static int ds41_load_payload(ds4_session *s, FILE *fp, const uint32_t *h,
 }
 #endif
 
+#ifdef DS4_V41_CPU_GRAPH
+/* Session snapshot save/restore for the V4.1 CPU graph. Same state, same
+ * architecture, same window/compressed/index/previous_kv/previous_score
+ * semantics as ds41_gpu_graph above -- ds41c_attention()'s actual
+ * window[il]+(pos%128)*512, compressed[owner]+(count-1)*512,
+ * index[owner]+(count-1)*128, and the previous_kv/score pairing on odd pos
+ * match ds41_state_spans()'s raw/live/parity formulas exactly -- but writes
+ * straight from host memory instead of reading back from VRAM, so no chunk
+ * buffer is needed. A different header tag (DS41C_PAYLOAD_TAG, "C41") than
+ * Metal's ("A41") keeps a GPU snapshot from loading into a CPU session or
+ * vice versa: the two backends are not guaranteed bit-identical. */
+#define DS41C_PAYLOAD_TAG 0x433431u /* "C41" */
+
+typedef struct {
+    const void *ptr;
+    uint64_t bytes;
+} ds41c_state_span;
+
+static uint32_t ds41c_state_spans(ds41_cpu_graph *g, uint32_t pos, ds41c_state_span spans[54]) {
+    uint32_t n = 0;
+    const uint32_t raw = pos < 128u ? pos : 128u;
+    for (uint32_t il = 0; il < 40; il++)
+        spans[n++] = (ds41c_state_span){g->window[il], (uint64_t)raw * 512u * 4u};
+    for (uint32_t i = 0; i < 4; i++) {
+        const uint32_t live = pos / (i < 3 ? 2u : 1u);
+        spans[n++] = (ds41c_state_span){g->compressed[i], (uint64_t)live * 512u * 4u};
+        spans[n++] = (ds41c_state_span){g->index[i], (uint64_t)live * 128u * 4u};
+        if (i < 3 && (pos & 1u)) {
+            spans[n++] = (ds41c_state_span){g->previous_kv[i], 512u * 4u};
+            spans[n++] = (ds41c_state_span){g->previous_score[i], 512u * 4u};
+        }
+    }
+    return n;
+}
+
+static uint64_t ds41c_payload_body_bytes(ds41_cpu_graph *g, uint32_t pos) {
+    ds41c_state_span spans[54];
+    const uint32_t n = ds41c_state_spans(g, pos, spans);
+    uint64_t bytes = ((uint64_t)pos + DS4_N_VOCAB) * sizeof(float);
+    for (uint32_t i = 0; i < n; i++) bytes += spans[i].bytes;
+    return bytes;
+}
+
+static int ds41c_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen) {
+    ds41_cpu_graph *g = s->v41_cpu;
+    if (!g->valid || g->pos != (uint32_t)s->checkpoint.len) {
+        payload_set_err(err, errlen, "V4.1 CPU graph has no complete frontier to save");
+        return 1;
+    }
+    const uint32_t h[DS4_SESSION_PAYLOAD_U32_FIELDS] = {
+        DS4_SESSION_PAYLOAD_MAGIC, DS4_SESSION_PAYLOAD_VERSION,
+        g->ctx, 1, 128, 128, g->ctx + 1u, g->pos, 40, 512, 128, DS4_N_VOCAB, DS41C_PAYLOAD_TAG
+    };
+    for (uint32_t i = 0; i < DS4_SESSION_PAYLOAD_U32_FIELDS; i++)
+        if (payload_write_u32(fp, h[i], err, errlen)) return 1;
+    for (int i = 0; i < s->checkpoint.len; i++)
+        if (payload_write_u32(fp, (uint32_t)s->checkpoint.v[i], err, errlen)) return 1;
+    if (payload_write_bytes(fp, s->logits, (uint64_t)DS4_N_VOCAB * 4u, err, errlen)) return 1;
+    ds41c_state_span spans[54];
+    const uint32_t n = ds41c_state_spans(g, g->pos, spans);
+    for (uint32_t i = 0; i < n; i++)
+        if (payload_write_bytes(fp, spans[i].ptr, spans[i].bytes, err, errlen)) return 1;
+    return 0;
+}
+
+static int ds41c_load_payload(ds4_session *s, FILE *fp, const uint32_t *h,
+                              uint64_t remaining, char *err, size_t errlen) {
+    ds41_cpu_graph *g = s->v41_cpu;
+    const uint32_t pos = h[7];
+    if (!pos || pos >= g->ctx || pos >= h[2] || h[2] > 1048576u ||
+        h[3] != 1 || h[4] != 128 || h[5] != 128 || h[6] != h[2] + 1u ||
+        h[8] != 40 || h[9] != 512 || h[10] != 128 || h[11] != DS4_N_VOCAB ||
+        h[12] != DS41C_PAYLOAD_TAG || remaining != ds41c_payload_body_bytes(g, pos)) {
+        payload_set_err(err, errlen, "invalid V4.1 CPU snapshot dimensions or size");
+        return 1;
+    }
+    ds4_tokens tokens = {0};
+    int rc = 0;
+    for (uint32_t i = 0; i < pos; i++) {
+        uint32_t token;
+        if (payload_read_u32(fp, &token, &remaining, err, errlen) || token >= DS4_N_VOCAB) {
+            payload_set_err(err, errlen, "invalid V4.1 CPU snapshot token");
+            rc = 1;
+            break;
+        }
+        token_vec_push(&tokens, (int)token);
+    }
+    if (!rc) {
+        s->checkpoint_valid = false;
+        g->valid = false;
+        rc = payload_read_bytes(fp, s->logits, (uint64_t)DS4_N_VOCAB * 4u, &remaining, err, errlen);
+        ds41c_state_span spans[54];
+        const uint32_t n = ds41c_state_spans(g, pos, spans);
+        for (uint32_t i = 0; i < n && !rc; i++)
+            rc = payload_read_bytes(fp, (void *)spans[i].ptr, spans[i].bytes, &remaining, err, errlen);
+        if (!rc) {
+            ds41c_reset(g);
+            for (uint32_t i = 0; i < 3 && i < pos; i++)
+                g->history.tail[i] = (int32_t)g->token_map[tokens.v[pos - 1u - i]];
+            g->pos = pos;
+            ds4_tokens_copy(&s->checkpoint, &tokens);
+            s->checkpoint_valid = true;
+        }
+    }
+    ds4_tokens_free(&tokens);
+    return rc;
+}
+#endif
+
 uint64_t ds4_session_payload_bytes(ds4_session *s) {
 #ifdef DS4_V41_CPU_GRAPH
-    if (s && s->v41_cpu) return 0;
+    if (s && s->v41_cpu) {
+        if (!s->checkpoint_valid || !s->v41_cpu->valid ||
+            s->v41_cpu->pos != (uint32_t)s->checkpoint.len) return 0;
+        return DS4_SESSION_PAYLOAD_U32_FIELDS * sizeof(uint32_t) +
+               ds41c_payload_body_bytes(s->v41_cpu, (uint32_t)s->checkpoint.len);
+    }
 #endif
     if (!s || !s->checkpoint_valid) return 0;
     if (s->distributed) return 0;
@@ -59745,7 +59859,11 @@ int ds4_session_stage_payload(ds4_session *s, ds4_session_payload_file *out,
 int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen) {
 #ifdef DS4_V41_CPU_GRAPH
     if (s && s->v41_cpu) {
-        payload_set_err(err, errlen, "V4.1 CPU snapshots are not implemented"); return 1;
+        if (!fp || !s->checkpoint_valid) {
+            payload_set_err(err, errlen, "session has no valid checkpoint to save");
+            return 1;
+        }
+        return ds41c_save_payload(s, fp, err, errlen);
     }
 #endif
     if (!s || !fp || !s->checkpoint_valid) {
@@ -60091,11 +60209,6 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
 }
 
 int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, char *err, size_t errlen) {
-#ifdef DS4_V41_CPU_GRAPH
-    if (s && s->v41_cpu) {
-        payload_set_err(err, errlen, "V4.1 CPU snapshots are not implemented"); return 1;
-    }
-#endif
     if (!s || !fp) {
         payload_set_err(err, errlen, "invalid session payload load");
         return 1;
@@ -60141,6 +60254,9 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
     }
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
     if (ds4_session_is_ds41(s)) return ds41_load_payload(s, fp, h, remaining, err, errlen);
+#endif
+#ifdef DS4_V41_CPU_GRAPH
+    if (s->v41_cpu) return ds41c_load_payload(s, fp, h, remaining, err, errlen);
 #endif
     if (ds4_session_is_glm(s)) {
 #ifdef DS4_NO_GPU

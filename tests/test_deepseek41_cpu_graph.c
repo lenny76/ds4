@@ -96,10 +96,124 @@ static int compare_prefill(int argc, char **argv) {
     free(a); free(b); free(la); free(lb); ds4_engine_close(e); return rc;
 }
 
+/* Save a session's V4.1 CPU state after SPLIT tokens through the real
+ * ds41c_save_payload()/ds41c_load_payload() functions and a real FILE*
+ * (matching how ds4-agent's kvstore uses them), restore it into a THIRD,
+ * never-touched graph, then continue both the untouched reference and the
+ * restored graph for the remaining tokens. Bit-exact final and continuation
+ * logits confirm the saved state (window/compressed/index/previous_kv/
+ * previous_score/history) is complete and correctly reconstructed, not just
+ * plausible-looking. */
+static int compare_snapshot(int argc, char **argv) {
+    if (argc < 6) return 2;
+    setenv("DS4_CPU_V41_EXPERIMENTAL", "1", 1);
+    ds4_engine_options opt = {.model_path = argv[2], .backend = DS4_BACKEND_CPU,
+        .context_size = 4096, .n_threads = 0, .power_percent = 100};
+    ds4_engine *e = NULL;
+    if (ds4_engine_open(&e, &opt)) return 1;
+
+    char *end = NULL;
+    long split = strtol(argv[3], &end, 10);
+    const int n = argc - 4;
+    if (end == argv[3] || *end || split < 1 || split >= n) {
+        ds4_engine_close(e);
+        return 2;
+    }
+
+    int *tokens = malloc((size_t)n * sizeof(*tokens));
+    for (int i = 0; i < n; i++) tokens[i] = atoi(argv[i + 4]);
+
+    ds41_cpu_graph *ref = calloc(1, sizeof(*ref));
+    ds41_cpu_graph *snap = calloc(1, sizeof(*snap));
+    ds41_cpu_graph *restored = calloc(1, sizeof(*restored));
+    float *la = malloc((size_t)DS4_N_VOCAB * sizeof(float));
+    float *lb = malloc((size_t)DS4_N_VOCAB * sizeof(float));
+    float *lc = malloc((size_t)DS4_N_VOCAB * sizeof(float));
+    int rc = 0;
+    if (!ref || !snap || !restored || !la || !lb || !lc ||
+        !ds41c_alloc(ref, &e->model, argv[2], 4096) ||
+        !ds41c_alloc(snap, &e->model, argv[2], 4096) ||
+        !ds41c_alloc(restored, &e->model, argv[2], 4096)) rc = 1;
+
+    for (int i = 0; !rc && i < (int)split; i++) {
+        if (!ds41c_step(ref, &e->model, &e->weights, tokens[i], i + 1 == split ? la : NULL) ||
+            !ds41c_step(snap, &e->model, &e->weights, tokens[i], i + 1 == split ? lb : NULL)) rc = 1;
+    }
+    if (!rc && memcmp(la, lb, (size_t)DS4_N_VOCAB * sizeof(float))) {
+        fputs("V4.1 snapshot: phase-1 graphs differ before any save/load\n", stderr);
+        rc = 1;
+    }
+
+    char err[256] = {0};
+    FILE *fp = !rc ? tmpfile() : NULL;
+    if (!rc && !fp) { fputs("tmpfile() failed\n", stderr); rc = 1; }
+
+    ds4_session save_s;
+    if (!rc) {
+        memset(&save_s, 0, sizeof(save_s));
+        save_s.v41_cpu = snap;
+        save_s.logits = lb;
+        save_s.checkpoint_valid = true;
+        for (int i = 0; i < (int)split; i++) token_vec_push(&save_s.checkpoint, tokens[i]);
+        if (ds41c_save_payload(&save_s, fp, err, sizeof(err))) {
+            fprintf(stderr, "V4.1 snapshot: save failed: %s\n", err);
+            rc = 1;
+        }
+    }
+
+    if (!rc) {
+        rewind(fp);
+        uint64_t remaining = (uint64_t)DS4_SESSION_PAYLOAD_U32_FIELDS * sizeof(uint32_t) +
+                             ds41c_payload_body_bytes(snap, (uint32_t)split);
+        uint32_t h[DS4_SESSION_PAYLOAD_U32_FIELDS];
+        for (uint32_t i = 0; !rc && i < DS4_SESSION_PAYLOAD_U32_FIELDS; i++)
+            if (payload_read_u32(fp, &h[i], &remaining, err, sizeof(err))) rc = 1;
+        ds4_session load_s;
+        if (!rc) {
+            memset(&load_s, 0, sizeof(load_s));
+            load_s.v41_cpu = restored;
+            load_s.logits = lc;
+            if (ds41c_load_payload(&load_s, fp, h, remaining, err, sizeof(err))) {
+                fprintf(stderr, "V4.1 snapshot: load failed: %s\n", err);
+                rc = 1;
+            } else if (memcmp(lb, lc, (size_t)DS4_N_VOCAB * sizeof(float))) {
+                fputs("V4.1 snapshot: restored logits differ from the saved graph's own\n", stderr);
+                rc = 1;
+            } else if (restored->pos != (uint32_t)split ||
+                       load_s.checkpoint.len != split ||
+                       memcmp(load_s.checkpoint.v, tokens, (size_t)split * sizeof(int))) {
+                fputs("V4.1 snapshot: restored pos/checkpoint do not match what was saved\n", stderr);
+                rc = 1;
+            }
+        }
+    }
+    if (fp) fclose(fp);
+
+    for (int i = (int)split; !rc && i < n; i++) {
+        const bool last = i + 1 == n;
+        if (!ds41c_step(ref, &e->model, &e->weights, tokens[i], last ? la : NULL) ||
+            !ds41c_step(restored, &e->model, &e->weights, tokens[i], last ? lc : NULL)) rc = 1;
+    }
+    if (!rc && memcmp(la, lc, (size_t)DS4_N_VOCAB * sizeof(float))) {
+        fputs("V4.1 snapshot: continuation after restore differs from the untouched reference\n", stderr);
+        rc = 1;
+    }
+    if (!rc) printf("V4.1 snapshot: save/restore at token %ld of %d bit-exact "
+                    "(final and %d-token continuation)\n", split, n, n - (int)split);
+
+    if (ref) ds41c_free(ref);
+    if (snap) ds41c_free(snap);
+    if (restored) ds41c_free(restored);
+    free(ref); free(snap); free(restored); free(la); free(lb); free(lc); free(tokens);
+    ds4_engine_close(e);
+    return rc;
+}
+
 int main(int argc, char **argv) {
     if (argc == 2 && !strcmp(argv[1], "--self-test-topk")) return test_topk_heap();
     if (argc == 2 && !strcmp(argv[1], "--self-test-q8-batch")) return test_q8_f32_batch();
     if (argc >= 2 && !strcmp(argv[1], "--compare-prefill")) return compare_prefill(argc, argv);
+    if (argc >= 2 && !strcmp(argv[1], "--compare-snapshot")) return compare_snapshot(argc, argv);
     if (argc < 3) {
         fprintf(stderr, "Usage: %s MODEL.gguf TOKEN_ID [TOKEN_ID ...]\n", argv[0]);
         return 2;

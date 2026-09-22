@@ -2195,6 +2195,50 @@ static void ds4_parallel_for(uint64_t n_rows, ds4_parallel_fn fn, void *ctx) {
     ds4_parallel_for_min_rows(n_rows, fn, ctx, 512);
 }
 
+/* Dynamic work-claiming for row-parallel kernels whose per-row cost is
+ * uneven and unknown ahead of dispatch (e.g. routed-MoE batch rows, where a
+ * row's cost is proportional to how many tokens picked that expert). A
+ * contiguous equal split can put every row of a "hot" expert on one or two
+ * threads. Every participating thread instead claims small runs of `chunk`
+ * rows from a shared atomic cursor until the range is exhausted, so the
+ * assignment adapts to the real workload instead of to row index alone.
+ * `fn` must ignore the [row0,row1) it is called with and process rows by
+ * looping ds4_parallel_for_dynamic_claim(ctx) itself -- see
+ * ds4_parallel_for_dynamic() below, which supplies that loop for a plain
+ * ds4_parallel_fn body via a wrapper context. */
+typedef struct {
+    ds4_parallel_fn inner;
+    void *inner_ctx;
+    uint64_t n_tasks;
+    uint64_t chunk;
+    volatile uint64_t next;
+} ds4_dynamic_for_ctx;
+
+static void ds4_dynamic_for_worker(void *vctx, uint64_t row0, uint64_t row1) {
+    (void)row0; (void)row1;
+    ds4_dynamic_for_ctx *dc = vctx;
+    for (;;) {
+        const uint64_t start = __sync_fetch_and_add(&dc->next, dc->chunk);
+        if (start >= dc->n_tasks) break;
+        uint64_t end = start + dc->chunk;
+        if (end > dc->n_tasks) end = dc->n_tasks;
+        dc->inner(dc->inner_ctx, start, end);
+    }
+}
+
+/* Same contract as ds4_parallel_for(n_tasks, fn, ctx), but every thread
+ * (main thread and pool workers alike) races to claim runs of `chunk` tasks
+ * from one shared cursor instead of taking a fixed contiguous slice. `fn`
+ * still receives real [task0,task1) sub-ranges, just smaller and claimed
+ * dynamically; accumulation order within and across tasks is unchanged, so
+ * results are bit-identical to the static split for any fn whose tasks are
+ * independent (true for the routed-MoE batch mid rows this exists for). */
+static void ds4_parallel_for_dynamic(uint64_t n_tasks, uint64_t chunk, ds4_parallel_fn fn, void *ctx) {
+    if (chunk == 0) chunk = 1;
+    ds4_dynamic_for_ctx dc = { .inner = fn, .inner_ctx = ctx, .n_tasks = n_tasks, .chunk = chunk, .next = 0 };
+    ds4_parallel_for_min_rows(n_tasks, ds4_dynamic_for_worker, &dc, 1);
+}
+
 static void cursor_error(ds4_cursor *c, const char *msg) {
     if (c->error[0] == '\0') {
         snprintf(c->error, sizeof(c->error), "%s at byte %" PRIu64, msg, c->pos);
@@ -10445,6 +10489,36 @@ static DS4_MAYBE_UNUSED void matvec_q2_k_batch_down_worker(void *vctx, uint64_t 
     }
 }
 
+/* Sums each token's down_pair rows back into moe[token][row] in slot order
+ * 0..DS4_N_EXPERT_USED-1 -- the same order the per-token reference
+ * (matvec_q2_k_accum_worker) adds its selected experts in. The expert-grouped
+ * dispatch above computes each (token,slot) pair's own down value without
+ * accumulating, precisely so this pass can add them back in the router's
+ * order instead of ascending-expert order; float addition is not
+ * associative, so this is what makes the grouped path bit-exact against the
+ * per-token path rather than merely close to it. */
+typedef struct {
+    float *moe;
+    const float *down_pair;
+    uint32_t n_tok;
+    uint64_t out_dim;
+} matvec_down_pair_combine_ctx;
+
+static void matvec_down_pair_combine_worker(void *vctx, uint64_t row0, uint64_t row1) {
+    matvec_down_pair_combine_ctx *ctx = vctx;
+    for (uint64_t row = row0; row < row1; row++) {
+        for (uint32_t t = 0; t < ctx->n_tok; t++) {
+            float acc = 0.0f;
+            const float *pair_row = ctx->down_pair +
+                (uint64_t)t * DS4_N_EXPERT_USED * ctx->out_dim + row;
+            for (uint32_t slot = 0; slot < DS4_N_EXPERT_USED; slot++) {
+                acc += pair_row[(uint64_t)slot * ctx->out_dim];
+            }
+            ctx->moe[(uint64_t)t * ctx->out_dim + row] = acc;
+        }
+    }
+}
+
 typedef struct {
     float *moe;
     const uint8_t *base[DS4_MAX_EXPERT];
@@ -12730,6 +12804,29 @@ static void layer_routed_moe_one_prealloc(
     (void)il;
 }
 
+/* The gate/up mid-projection dispatch below is (active_expert, out_row)
+ * tasks; a static contiguous split gives every row of a hot expert (one
+ * picked by most tokens in the batch) to the one or two threads whose slice
+ * lands on it, while the rest sit idle -- see the 2026-09-21 expert-token
+ * histogram in .local-notes/HANDOFF.md (mean imbalance 4.7x, max 9.7x at
+ * routine chunk sizes). Claiming small dynamic runs instead lets every
+ * thread's total work converge to its fair share regardless of where expert
+ * boundaries fall. Tunable only for A/B measurement; not meant to be a
+ * permanent knob. */
+static uint64_t ds4_routed_batch_mid_chunk(void) {
+    static long chunk = -1;
+    if (chunk < 0) {
+        chunk = 8;
+        const char *env = getenv("DS4_CPU_ROUTED_MID_CHUNK");
+        if (env && env[0]) {
+            char *end = NULL;
+            long v = strtol(env, &end, 10);
+            if (end != env && !*end && v > 0) chunk = v;
+        }
+    }
+    return (uint64_t)chunk;
+}
+
 /* Prefill MoE groups token/expert pairs by expert so each active expert's
  * rows are scanned once for the whole token batch. */
 static void layer_routed_moe_batch(
@@ -12740,7 +12837,8 @@ static void layer_routed_moe_batch(
         const int         * token_ids,
         uint32_t            n_tok,
         uint32_t            il,
-        float               clamp) {
+        float               clamp,
+        bool                preserve_token_order) {
     const uint64_t expert_in_dim = layer->ffn_gate_exps->dim[0];
     const uint64_t expert_out_dim = layer->ffn_gate_exps->dim[1];
     const uint64_t down_in_dim = layer->ffn_down_exps->dim[0];
@@ -12846,7 +12944,7 @@ static void layer_routed_moe_batch(
                 ds4_die("Q8_0 batch expert tensor layout mismatch");
             }
         }
-        ds4_parallel_for((uint64_t)n_active * expert_out_dim, matvec_q8_0_batch_mid_worker, &mid_ctx);
+        ds4_parallel_for_dynamic((uint64_t)n_active * expert_out_dim, ds4_routed_batch_mid_chunk(), matvec_q8_0_batch_mid_worker, &mid_ctx);
 
         const uint64_t mid_blocks = down_in_dim / 32u;
         int8_t *midq8 = xmalloc((size_t)total_pairs * mid_blocks * 32u);
@@ -12882,6 +12980,7 @@ static void layer_routed_moe_batch(
                 ds4_die("Q8_0 batch down expert tensor layout mismatch");
             }
         }
+        if (preserve_token_order) ds4_die("preserve_token_order routed batch is only implemented for Q2_K down (V4.1 CPU)");
         ds4_parallel_for(down_out_dim, matvec_q8_0_batch_accum_rows_worker, &down_ctx);
 
         free(midscale8);
@@ -12935,7 +13034,7 @@ static void layer_routed_moe_batch(
             }
         }
 
-        ds4_parallel_for((uint64_t)n_active * expert_out_dim, matvec_q8_k_batch_mid_worker, &mid_ctx);
+        ds4_parallel_for_dynamic((uint64_t)n_active * expert_out_dim, ds4_routed_batch_mid_chunk(), matvec_q8_k_batch_mid_worker, &mid_ctx);
 
         const uint64_t midq_blocks = down_in_dim / QK_K;
         block_q8_K *midq = xmalloc((size_t)total_pairs * midq_blocks * sizeof(midq[0]));
@@ -12972,6 +13071,7 @@ static void layer_routed_moe_batch(
             }
         }
 
+        if (preserve_token_order) ds4_die("preserve_token_order routed batch is only implemented for Q2_K down (V4.1 CPU)");
         ds4_parallel_for(down_out_dim, matvec_q8_k_batch_accum_rows_worker, &down_ctx);
 
         free(midq);
@@ -13027,7 +13127,7 @@ static void layer_routed_moe_batch(
             }
         }
 
-        ds4_parallel_for((uint64_t)n_active * expert_out_dim, matvec_iq2_xxs_batch_mid_worker, &mid_ctx);
+        ds4_parallel_for_dynamic((uint64_t)n_active * expert_out_dim, ds4_routed_batch_mid_chunk(), matvec_iq2_xxs_batch_mid_worker, &mid_ctx);
     } else if (gate_type == DS4_TENSOR_Q2_K) {
         matvec_q2_k_batch_mid_ctx mid_ctx = {
             .mid = mid,
@@ -13057,7 +13157,7 @@ static void layer_routed_moe_batch(
             }
         }
 
-        ds4_parallel_for((uint64_t)n_active * expert_out_dim, matvec_q2_k_batch_mid_worker, &mid_ctx);
+        ds4_parallel_for_dynamic((uint64_t)n_active * expert_out_dim, ds4_routed_batch_mid_chunk(), matvec_q2_k_batch_mid_worker, &mid_ctx);
     } else if (gate_type == DS4_TENSOR_Q4_K) {
         matvec_q4_k_batch_mid_ctx mid_ctx = {
             .mid = mid,
@@ -13087,7 +13187,7 @@ static void layer_routed_moe_batch(
             }
         }
 
-        ds4_parallel_for((uint64_t)n_active * expert_out_dim, matvec_q4_k_batch_mid_worker, &mid_ctx);
+        ds4_parallel_for_dynamic((uint64_t)n_active * expert_out_dim, ds4_routed_batch_mid_chunk(), matvec_q4_k_batch_mid_worker, &mid_ctx);
     } else {
         ds4_die("unsupported gate/up expert tensor type for batch");
     }
@@ -13131,33 +13231,65 @@ static void layer_routed_moe_batch(
             }
         }
 
+        if (preserve_token_order) ds4_die("preserve_token_order routed batch is only implemented for Q2_K down (V4.1 CPU)");
         ds4_parallel_for(down_out_dim, matvec_iq2_xxs_batch_accum_rows_worker, &down_ctx);
     } else if (down_type == DS4_TENSOR_Q2_K) {
-        matvec_q2_k_batch_accum_rows_ctx down_ctx = {
-            .moe = moe,
-            .midq = midq,
-            .pairs = pairs,
-            .pair_ids = pair_ids,
-            .expert_offset = counts,
-            .active_expert = active_expert,
-            .n_active = n_active,
-            .n_tok = n_tok,
-            .in_dim = down_in_dim,
-            .out_dim = down_out_dim,
-            .midq_blocks = midq_blocks,
-        };
-
+        const uint8_t *base[DS4_MAX_EXPERT] = {0};
+        uint64_t row_bytes[DS4_MAX_EXPERT] = {0};
         for (uint32_t ai = 0; ai < n_active; ai++) {
             const uint32_t e = active_expert[ai];
             uint64_t in_dim, out_dim;
-            down_ctx.base[e] = tensor_expert_bytes(model, layer->ffn_down_exps, e,
-                                                   &in_dim, &out_dim, &down_ctx.row_bytes[e]);
+            base[e] = tensor_expert_bytes(model, layer->ffn_down_exps, e,
+                                          &in_dim, &out_dim, &row_bytes[e]);
             if (in_dim != down_in_dim || out_dim != down_out_dim) {
                 ds4_die("batch expert tensor layout mismatch");
             }
         }
 
-        ds4_parallel_for(down_out_dim, matvec_q2_k_batch_accum_rows_worker, &down_ctx);
+        if (preserve_token_order) {
+            /* Compute each (token,slot) pair's own down value without
+             * accumulating (grouped by expert for one weight read per row),
+             * then add each token's DS4_N_EXPERT_USED values back in slot
+             * order -- see matvec_down_pair_combine_worker(). */
+            float *down_pair = xmalloc((size_t)total_pairs * down_out_dim * sizeof(down_pair[0]));
+            matvec_q2_k_batch_down_ctx down_ctx = {
+                .down_pair = down_pair,
+                .midq = midq,
+                .pair_ids = pair_ids,
+                .expert_offset = counts,
+                .active_expert = active_expert,
+                .in_dim = down_in_dim,
+                .out_dim = down_out_dim,
+                .midq_blocks = midq_blocks,
+            };
+            memcpy(down_ctx.base, base, sizeof(base));
+            memcpy(down_ctx.row_bytes, row_bytes, sizeof(row_bytes));
+            ds4_parallel_for_dynamic((uint64_t)n_active * down_out_dim, ds4_routed_batch_mid_chunk(),
+                                     matvec_q2_k_batch_down_worker, &down_ctx);
+
+            matvec_down_pair_combine_ctx combine_ctx = {
+                .moe = moe, .down_pair = down_pair, .n_tok = n_tok, .out_dim = down_out_dim,
+            };
+            ds4_parallel_for(down_out_dim, matvec_down_pair_combine_worker, &combine_ctx);
+            free(down_pair);
+        } else {
+            matvec_q2_k_batch_accum_rows_ctx down_ctx = {
+                .moe = moe,
+                .midq = midq,
+                .pairs = pairs,
+                .pair_ids = pair_ids,
+                .expert_offset = counts,
+                .active_expert = active_expert,
+                .n_active = n_active,
+                .n_tok = n_tok,
+                .in_dim = down_in_dim,
+                .out_dim = down_out_dim,
+                .midq_blocks = midq_blocks,
+            };
+            memcpy(down_ctx.base, base, sizeof(base));
+            memcpy(down_ctx.row_bytes, row_bytes, sizeof(row_bytes));
+            ds4_parallel_for(down_out_dim, matvec_q2_k_batch_accum_rows_worker, &down_ctx);
+        }
     } else if (down_type == DS4_TENSOR_Q4_K) {
         matvec_q4_k_batch_accum_rows_ctx down_ctx = {
             .moe = moe,
@@ -13183,6 +13315,7 @@ static void layer_routed_moe_batch(
             }
         }
 
+        if (preserve_token_order) ds4_die("preserve_token_order routed batch is only implemented for Q2_K down (V4.1 CPU)");
         ds4_parallel_for(down_out_dim, matvec_q4_k_batch_accum_rows_worker, &down_ctx);
     } else {
         ds4_die("unsupported down expert tensor type for batch");
@@ -13422,7 +13555,7 @@ static void layer_ffn_batch(
                         DS4_RMS_EPS);
     }
 
-    layer_routed_moe_batch(moe, model, layer, norm, token_ids, n_tok, il, DS4_SWIGLU_CLAMP_EXP);
+    layer_routed_moe_batch(moe, model, layer, norm, token_ids, n_tok, il, DS4_SWIGLU_CLAMP_EXP, false);
     layer_shared_ffn_batch(shared, model, layer, norm, n_tok);
 
     if (cpu_directional_steering_enabled(steering_dirs, steering_scale)) {
@@ -70228,13 +70361,17 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
             if (ds4_session_cancelled(s)) {
                 snprintf(err, errlen, "interrupted"); return DS4_SESSION_SYNC_INTERRUPTED;
             }
-            unsigned chunk = getenv("DS4_CPU_V41_DISABLE_BATCH_PREFILL") ? 1u : 16u;
+            /* 32 is the default since the routed-MoE batch (bd55e48's series
+             * plus the 2026-09-22 expert grouping) measured +9 to +19%
+             * prefill over 16 at both 512 and 2048 tokens context, bit-exact
+             * and decode-neutral; see .local-notes/HANDOFF.md. */
+            unsigned chunk = getenv("DS4_CPU_V41_DISABLE_BATCH_PREFILL") ? 1u : 32u;
             const char *batch_env = getenv("DS4_CPU_V41_BATCH_PREFILL");
             if (chunk > 1 && batch_env) {
                 char *end = NULL;
                 unsigned long requested = strtoul(batch_env, &end, 10);
                 if (end != batch_env && !*end && requested >= 2) chunk = (unsigned)requested;
-                if (chunk > 16) chunk = 16;
+                if (chunk > DS4_V41_PREFILL_CHUNK_MAX) chunk = DS4_V41_PREFILL_CHUNK_MAX;
             }
             const unsigned left = (unsigned)(prompt->len - i);
             if (chunk > left) chunk = left;

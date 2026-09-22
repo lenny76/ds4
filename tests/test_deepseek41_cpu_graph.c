@@ -66,7 +66,7 @@ static int test_q8_f32_batch(void) {
 }
 
 static int compare_prefill(int argc, char **argv) {
-    if (argc < 5 || argc - 3 > 16) return 2;
+    if (argc < 5 || argc - 3 > DS4_V41_PREFILL_CHUNK_MAX) return 2;
     setenv("DS4_CPU_V41_EXPERIMENTAL", "1", 1);
     ds4_engine_options opt = {.model_path = argv[2], .backend = DS4_BACKEND_CPU,
         .context_size = 4096, .n_threads = 0, .power_percent = 100};
@@ -75,7 +75,7 @@ static int compare_prefill(int argc, char **argv) {
     ds41_cpu_graph *a = calloc(1, sizeof(*a)), *b = calloc(1, sizeof(*b));
     float *la = malloc((size_t)DS4_N_VOCAB * sizeof(float));
     float *lb = malloc((size_t)DS4_N_VOCAB * sizeof(float));
-    int tokens[16], n = argc - 3, rc = 0;
+    int tokens[DS4_V41_PREFILL_CHUNK_MAX], n = argc - 3, rc = 0;
     for (int i = 0; i < n; i++) tokens[i] = atoi(argv[i + 3]);
     if (!a || !b || !la || !lb || !ds41c_alloc(a, &e->model, argv[2], 4096) ||
         !ds41c_alloc(b, &e->model, argv[2], 4096)) rc = 1;

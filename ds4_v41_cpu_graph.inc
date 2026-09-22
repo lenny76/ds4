@@ -3,6 +3,12 @@
  * ownership, Engram history and BF16 boundaries have one implementation. */
 #include "ds4_v41_cpu.h"
 
+/* Upper bound on tokens per dense-projection prefill chunk (ds41c_prefill_chunk
+ * and its driver loop in ds4.c). The default chunk stays 16 (bd55e48) until a
+ * larger one is measured and accepted; this only raises what
+ * DS4_CPU_V41_BATCH_PREFILL is allowed to request for A/B testing. */
+#define DS4_V41_PREFILL_CHUNK_MAX 64
+
 typedef struct {
     uint32_t ctx, pos;
     bool valid;
@@ -341,7 +347,7 @@ static void ds41c_mat_batch(float *out, const ds4_model *m, const ds4_tensor *w,
 static bool ds41c_prefill_chunk(ds41_cpu_graph *g, const ds4_model *m,
                                 const ds4_weights *w, const int *token,
                                 uint32_t count, float *logits) {
-    if (!count || count > 16 || !g->valid || g->pos + count > g->ctx) return false;
+    if (!count || count > DS4_V41_PREFILL_CHUNK_MAX || !g->valid || g->pos + count > g->ctx) return false;
     const uint64_t hc = 4u * DS4_N_EMBD, e = DS4_N_EMBD;
 #define BALLOC(name, n) float *name = calloc((size_t)(n), sizeof(float));
     BALLOC(residual, (uint64_t)count * hc) BALLOC(after, (uint64_t)count * hc)
@@ -360,7 +366,7 @@ static bool ds41c_prefill_chunk(ds41_cpu_graph *g, const ds4_model *m,
               mid && pre && attn_split && ffn_split && disk && selected && allowed;
     const uint32_t initial = g->pos, allowed_stride = (g->ctx + 7u) / 8u;
     ds4_engram_history history = g->history;
-    uint32_t ids[16][2][24];
+    uint32_t ids[DS4_V41_PREFILL_CHUNK_MAX][2][24];
     g->valid = false;
     for (uint32_t t = 0; ok && t < count; t++) {
         ok = token[t] >= 0 && (uint32_t)token[t] < DS4_N_VOCAB &&
@@ -459,9 +465,25 @@ static bool ds41c_prefill_chunk(ds41_cpu_graph *g, const ds4_model *m,
             ds41c_round(mid + (uint64_t)t * DS4_N_FF_EXP, DS4_N_FF_EXP);
         }
         ds41c_mat_batch(shared, m, l->ffn_down_shexp, mid, count, true);
+        /* block[] (count*e) is free here: its attention-output content was
+         * last consumed by the attn_post loop above. Reuse it as the
+         * routed-MoE output for the whole chunk when batching is enabled,
+         * instead of allocating a separate buffer. Grouping token/expert
+         * pairs by expert cuts routed weight bytes read per chunk (measured
+         * +9 to +19% prefill at chunk 16/32, bit-exact); rollback with
+         * DS4_CPU_V41_DISABLE_ROUTED_BATCH=1. See .local-notes/HANDOFF.md. */
+        static int routed_batch = -1;
+        if (routed_batch < 0) routed_batch = getenv("DS4_CPU_V41_DISABLE_ROUTED_BATCH") ? 0 : 1;
+        if (ok && routed_batch && count > 1) {
+            layer_routed_moe_batch(block, m, l, norm, token, count, il, DS4_SWIGLU_CLAMP_EXP, true);
+        }
         for (uint32_t t = 0; ok && t < count; t++) {
-            layer_routed_moe_one(g->block, m, l, norm + (uint64_t)t * e,
-                                 il, token[t], DS4_SWIGLU_CLAMP_EXP, false);
+            if (routed_batch && count > 1) {
+                memcpy(g->block, block + (uint64_t)t * e, e * sizeof(float));
+            } else {
+                layer_routed_moe_one(g->block, m, l, norm + (uint64_t)t * e,
+                                     il, token[t], DS4_SWIGLU_CLAMP_EXP, false);
+            }
             for (unsigned d = 0; d < DS4_N_EMBD; d++)
                 g->block[d] = ds41_cpu_bf16(g->block[d] + shared[(uint64_t)t * e + d]);
             hc_post_one(residual + (uint64_t)t * hc, g->block,

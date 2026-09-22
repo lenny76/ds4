@@ -512,6 +512,44 @@ static bool ds41c_prefill_chunk(ds41_cpu_graph *g, const ds4_model *m,
     return ok;
 }
 
+/* Upstream (antirez/ds4 6c00e2d) found single-token V4.1 decode reads 48
+ * Engram rows (24 per table, 2 tables) serially through ds4_engram_read(),
+ * paying full random-read latency on every row before any other work; fixed
+ * on Metal by routing through ds4_engram_read_batch(), whose fixed-worker
+ * concurrency hides that latency. Upstream deliberately kept the >=256-row
+ * gate on Linux/CUDA/ROCm (077a257) because that path spawns fresh pthreads
+ * per call, and 48 rows is too few to be worth per-token thread creation.
+ * We already keep a warm persistent pool for exactly this reason: dispatch
+ * the same 48 independent preads through it instead, at the pool's usual
+ * spin-wait dispatch cost rather than pthread_create/join. Opt-in: a warm-
+ * cache benchmark measured no difference (Engram rows were already in page
+ * cache), so this is unproven rather than a demonstrated win; it should
+ * help a cold SATA read instead. See .local-notes/HANDOFF.md. */
+typedef struct {
+    ds4_engram_table *tables;
+    const uint32_t (*ids)[24];
+    float *disk_rows[2];
+    volatile int failed;
+} ds41c_engram_decode_ctx;
+
+static void ds41c_engram_decode_worker(void *vctx, uint64_t r0, uint64_t r1) {
+    ds41c_engram_decode_ctx *c = vctx;
+    for (uint64_t r = r0; r < r1; r++) {
+        const unsigned table = r < 24 ? 0 : 1;
+        const uint64_t row = r < 24 ? r : r - 24;
+        if (!ds4_engram_read(&c->tables[table], &c->ids[table][row], 1,
+                             c->disk_rows[table] + row * DS4_ENGRAM_DIM)) {
+            __sync_bool_compare_and_swap(&c->failed, 0, 1);
+        }
+    }
+}
+
+static bool ds41c_engram_decode_parallel(void) {
+    static int enabled = -1;
+    if (enabled < 0) enabled = getenv("DS4_CPU_V41_ENGRAM_DECODE_PARALLEL") ? 1 : 0;
+    return enabled != 0;
+}
+
 static bool ds41c_step(ds41_cpu_graph *g, const ds4_model *m, const ds4_weights *w, int token, float *logits) {
     if (!g->valid || g->pos >= g->ctx || token < 0 || (uint32_t)token >= DS4_N_VOCAB) return false;
     const bool profile = getenv("DS4_CPU_V41_PROFILE") != NULL;
@@ -520,8 +558,21 @@ static bool ds41c_step(ds41_cpu_graph *g, const ds4_model *m, const ds4_weights 
     double started = profile ? now_sec() : 0.0;
     ds4_engram_history history = g->history; uint32_t ids[2][24];
     if (!ds4_engram_hash(&g->engram, &history, &token, NULL, 1, &ids[0][0])) return false;
-    for (unsigned i = 0; i < 2; i++)
-        if (!ds4_engram_read(&g->tables[i], ids[i], 24, g->disk_rows[i])) return false;
+    if (ds41c_engram_decode_parallel()) {
+        ds41c_engram_decode_ctx ctx = {
+            .tables = g->tables, .ids = ids,
+            .disk_rows = { g->disk_rows[0], g->disk_rows[1] }, .failed = 0,
+        };
+        /* Bypass ds4_parallel_for()'s 512-row MAC-cost admission threshold:
+         * these "rows" are independent preads, not FLOPs, and 48 of them
+         * already dominate a decode step at storage latencies far above the
+         * pool's own dispatch cost. */
+        ds4_parallel_for_min_rows(48, ds41c_engram_decode_worker, &ctx, 1);
+        if (ctx.failed) return false;
+    } else {
+        for (unsigned i = 0; i < 2; i++)
+            if (!ds4_engram_read(&g->tables[i], ids[i], 24, g->disk_rows[i])) return false;
+    }
     if (profile) engram_sec += now_sec() - started;
     g->valid = false;
     embed_token_any(m, w, token, g->x);

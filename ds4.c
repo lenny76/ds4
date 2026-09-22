@@ -1200,20 +1200,32 @@ static inline int32_t hsum256_epi32(__m256i v) {
     return _mm_cvtsi128_si32(_mm_add_epi32(t, _mm_shuffle_epi32(t, 0xb1)));
 }
 
-static inline __m256i dot_iq2_quad_32(const int8_t *g0, const int8_t *g1,
-                                      const int8_t *g2, const int8_t *g3,
-                                      const int8_t *q8) {
+/* The packed, sign-applied grid vector is a pure function of the four IQ2_XXS
+ * grid pointers (weight bits only); dot_iq2_quad_32() below builds it fresh
+ * on every call because its caller re-resolves the same weight row for every
+ * token. Split out so a row-level cache (see iq2_decode_row()) can build it
+ * once per row and reuse it across every token that reads that row. */
+static inline __m256i iq2_quad_gv(const int8_t *g0, const int8_t *g1,
+                                  const int8_t *g2, const int8_t *g3) {
     const __m128i lo = _mm_unpacklo_epi64(_mm_loadl_epi64((const __m128i *)g0),
                                           _mm_loadl_epi64((const __m128i *)g1));
     const __m128i hi = _mm_unpacklo_epi64(_mm_loadl_epi64((const __m128i *)g2),
                                           _mm_loadl_epi64((const __m128i *)g3));
-    const __m256i gv = _mm256_xor_si256(_mm256_set_m128i(hi, lo),
-                                        _mm256_set1_epi8((char)0x80));
+    return _mm256_xor_si256(_mm256_set_m128i(hi, lo), _mm256_set1_epi8((char)0x80));
+}
+
+static inline __m256i dot_iq2_quad_32_gv(__m256i gv, const int8_t *q8) {
     const __m256i qv = _mm256_loadu_si256((const __m256i *)q8);
     const __m256i prod = _mm256_dpbusd_epi32(_mm256_setzero_si256(), gv, qv);
     const __m256i pairs = _mm256_maddubs_epi16(_mm256_set1_epi8(1), qv);
     const __m256i qsum4 = _mm256_madd_epi16(pairs, _mm256_set1_epi16(1));
     return _mm256_sub_epi32(prod, _mm256_slli_epi32(qsum4, 7));
+}
+
+static inline __m256i dot_iq2_quad_32(const int8_t *g0, const int8_t *g1,
+                                      const int8_t *g2, const int8_t *g3,
+                                      const int8_t *q8) {
+    return dot_iq2_quad_32_gv(iq2_quad_gv(g0, g1, g2, g3), q8);
 }
 
 /* Lanes 0-3 cover q2/q8 bytes 0-15, lanes 4-7 cover bytes 16-31, so the two
@@ -4479,6 +4491,70 @@ static DS4_MAYBE_UNUSED void ds4_vec_dot_iq2_xxs_q8_K(int n, float *s, const blo
     *s = 0.125f * sumf;
 #endif
 }
+
+#if defined(__AVX512VNNI__) && defined(__AVX512VL__)
+/* Row-level weight decode for IQ2_XXS, reused across every token that reads
+ * the row. The routed-MoE prefill batch (matvec_iq2_xxs_batch_mid_worker)
+ * groups token/expert pairs by expert precisely so each row is read once
+ * per chunk instead of once per token; ds4_vec_dot_iq2_xxs_q8_K's own
+ * AVX-512VNNI path still re-resolves this row's iq2xxs_signed_grid lookups
+ * and per-block `ls` scale on every one of those per-token calls, even
+ * though neither depends on the token's activation. iq2_decode_row() does
+ * that resolution once; iq2_dot_decoded() walks the same per-block,
+ * per-ib32 order over the cached values, so it is bit-exact against
+ * ds4_vec_dot_iq2_xxs_q8_K for any (row, activation) pair -- this only
+ * hoists work out of the token loop, it does not change any accumulation. */
+#define DS4_IQ2_DECODE_MAX_IB32 512
+typedef struct {
+    __m256i gv;
+    int32_t ls;
+} iq2_decoded_ib32;
+
+static int iq2_decode_row(const block_iq2_xxs *x, int n, float *block_d, iq2_decoded_ib32 *out) {
+    const int nb = n / QK_K;
+    if (nb * (QK_K / 32) > DS4_IQ2_DECODE_MAX_IB32) {
+        ds4_die("IQ2_XXS row exceeds the decoded-row cache; raise DS4_IQ2_DECODE_MAX_IB32");
+    }
+    int idx = 0;
+    for (int i = 0; i < nb; i++) {
+        block_d[i] = f16_to_f32(x[i].d);
+        const uint16_t *q2 = x[i].qs;
+        for (int ib32 = 0; ib32 < QK_K / 32; ib32++) {
+            uint32_t aux32[2];
+            const uint8_t *aux8 = (const uint8_t *)aux32;
+            memcpy(aux32, q2, 2 * sizeof(uint32_t));
+            q2 += 4;
+            out[idx].ls = (int32_t)(2 * (aux32[1] >> 28) + 1);
+            out[idx].gv = iq2_quad_gv(
+                iq2xxs_signed_grid[aux8[0]][(aux32[1] >>  0) & 127],
+                iq2xxs_signed_grid[aux8[1]][(aux32[1] >>  7) & 127],
+                iq2xxs_signed_grid[aux8[2]][(aux32[1] >> 14) & 127],
+                iq2xxs_signed_grid[aux8[3]][(aux32[1] >> 21) & 127]);
+            idx++;
+        }
+    }
+    return nb;
+}
+
+static void iq2_dot_decoded(const iq2_decoded_ib32 *dec, const float *block_d, int nb,
+                            const block_q8_K *y, float *s) {
+    float sumf = 0.0f;
+    int idx = 0;
+    for (int i = 0; i < nb; i++) {
+        const float d = block_d[i] * y[i].d;
+        const int8_t *q8 = y[i].qs;
+        __m256i bacc = _mm256_setzero_si256();
+        for (int ib32 = 0; ib32 < QK_K / 32; ib32++) {
+            const __m256i prod = dot_iq2_quad_32_gv(dec[idx].gv, q8);
+            bacc = _mm256_add_epi32(bacc, _mm256_mullo_epi32(prod, _mm256_set1_epi32(dec[idx].ls)));
+            q8 += 32;
+            idx++;
+        }
+        sumf += d * (float)hsum256_epi32(bacc);
+    }
+    *s = 0.125f * sumf;
+}
+#endif
 
 static void ds4_vec_dot_iq2_xxs_pair_q8_K(
         int n,
@@ -10321,6 +10397,14 @@ typedef struct {
 
 static void matvec_iq2_xxs_batch_mid_worker(void *vctx, uint64_t task0, uint64_t task1) {
     matvec_iq2_xxs_batch_mid_ctx *ctx = vctx;
+#if defined(__AVX512VNNI__) && defined(__AVX512VL__)
+    static int decode_once = -1;
+    if (decode_once < 0) decode_once = getenv("DS4_CPU_DISABLE_IQ2_DECODE_ONCE") ? 0 : 1;
+    iq2_decoded_ib32 gate_dec[DS4_IQ2_DECODE_MAX_IB32], up_dec[DS4_IQ2_DECODE_MAX_IB32];
+    float gate_bd[DS4_IQ2_DECODE_MAX_IB32 / (QK_K / 32)], up_bd[DS4_IQ2_DECODE_MAX_IB32 / (QK_K / 32)];
+#else
+    const int decode_once = 0;
+#endif
 
     for (uint64_t task = task0; task < task1; task++) {
         const uint32_t active_idx = (uint32_t)(task / ctx->out_dim);
@@ -10331,6 +10415,13 @@ static void matvec_iq2_xxs_batch_mid_worker(void *vctx, uint64_t task0, uint64_t
 
         const block_iq2_xxs *gate_row = (const block_iq2_xxs *)(ctx->gate_base[expert] + row * ctx->gate_row_bytes[expert]);
         const block_iq2_xxs *up_row = (const block_iq2_xxs *)(ctx->up_base[expert] + row * ctx->up_row_bytes[expert]);
+#if defined(__AVX512VNNI__) && defined(__AVX512VL__)
+        int nb = 0;
+        if (decode_once) {
+            nb = iq2_decode_row(gate_row, (int)ctx->in_dim, gate_bd, gate_dec);
+            iq2_decode_row(up_row, (int)ctx->in_dim, up_bd, up_dec);
+        }
+#endif
 
         for (uint32_t i = begin; i < end; i++) {
             const uint32_t pair_id = ctx->pair_ids[i];
@@ -10339,6 +10430,12 @@ static void matvec_iq2_xxs_batch_mid_worker(void *vctx, uint64_t task0, uint64_t
             float gate = 0.0f;
             float up = 0.0f;
 
+#if defined(__AVX512VNNI__) && defined(__AVX512VL__)
+            if (decode_once) {
+                iq2_dot_decoded(gate_dec, gate_bd, nb, xq, &gate);
+                iq2_dot_decoded(up_dec, up_bd, nb, xq, &up);
+            } else
+#endif
             ds4_vec_dot_iq2_xxs_pair_q8_K((int)ctx->in_dim, &gate, &up, gate_row, up_row, xq);
 
             if (ctx->clamp > 1.0e-6f) {
